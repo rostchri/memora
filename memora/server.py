@@ -50,6 +50,7 @@ from .storage import (
     sync_to_cloud,
     update_crossrefs,
     update_memory,
+    validate_follow,
 )
 
 logger = logging.getLogger(__name__)
@@ -205,8 +206,8 @@ def _create_memory(
 
 
 @_with_connection
-def _get_memory(conn, memory_id: int):
-    return get_memory(conn, memory_id)
+def _get_memory(conn, memory_id: int, follow: Optional[str] = None):
+    return get_memory(conn, memory_id, follow=follow)
 
 
 @_with_connection(writes=True)
@@ -248,11 +249,13 @@ def _list_memories(
     tags_all: Optional[List[str]],
     tags_none: Optional[List[str]],
     sort_by_importance: bool = False,
+    follow: Optional[str] = None,
 ):
     return list_memories(
         conn, query, metadata_filters, limit, offset,
         date_from, date_to, tags_any, tags_all, tags_none,
         sort_by_importance=sort_by_importance,
+        follow=follow,
     )
 
 
@@ -306,6 +309,7 @@ def _semantic_search(
     metadata_filters: Optional[Dict[str, Any]],
     top_k: Optional[int],
     min_score: Optional[float],
+    follow: Optional[str] = None,
 ):
     return semantic_search(
         conn,
@@ -313,6 +317,7 @@ def _semantic_search(
         metadata_filters=metadata_filters,
         top_k=top_k,
         min_score=min_score,
+        follow=follow,
     )
 
 
@@ -329,6 +334,7 @@ def _hybrid_search(
     tags_any: Optional[List[str]],
     tags_all: Optional[List[str]],
     tags_none: Optional[List[str]],
+    follow: Optional[str] = None,
 ):
     return hybrid_search(
         conn,
@@ -342,6 +348,7 @@ def _hybrid_search(
         tags_any=tags_any,
         tags_all=tags_all,
         tags_none=tags_none,
+        follow=follow,
     )
 
 
@@ -812,6 +819,7 @@ async def memory_list(
     content_mode: str = "preview",
     preview_chars: int = 120,
     fields: Optional[List[str]] = None,
+    follow: Optional[str] = None,
 ) -> Dict[str, Any]:
     """List memories, optionally filtering by substring query or metadata.
 
@@ -833,12 +841,19 @@ async def memory_list(
         content_mode: "preview" (default) returns truncated content_preview; "full" returns complete content
         preview_chars: Max chars for preview (default: 120, ignored when content_mode="full")
         fields: Optional list of fields to return (e.g. ["id","content_preview","tags"]). None returns all fields.
+        follow: Lineage mode — "latest" resolves each result to its current version,
+                "active" excludes superseded memories, "full_history" expands supersession chains.
     """
+    try:
+        validate_follow(follow)
+    except ValueError as exc:
+        return {"error": "invalid_follow", "message": str(exc)}
     try:
         items = _list_memories(
             query, metadata_filters, limit, offset,
             date_from, date_to, tags_any, tags_all, tags_none,
             sort_by_importance,
+            follow=follow,
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
@@ -965,6 +980,7 @@ async def memory_get(
     memory_id: int,
     include_images: bool = False,
     fields: Optional[List[str]] = None,
+    follow: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Retrieve a single memory by id (full content by default).
 
@@ -972,16 +988,28 @@ async def memory_get(
         memory_id: ID of the memory to retrieve
         include_images: If False, strip image data from metadata to reduce response size
         fields: Optional list of fields to return (e.g. ["id","content","tags"]). None returns all fields.
+        follow: Lineage mode — "latest" resolves to the current version (walks supersedes chains),
+                "full_history" adds a "history" key with all versions from root to leaf.
     """
-    record = _get_memory(memory_id)
+    try:
+        record = _get_memory(memory_id, follow=follow)
+    except ValueError as exc:
+        return {"error": "invalid_follow", "message": str(exc)}
     if not record:
         return {"error": "not_found", "id": memory_id}
 
-    metadata = record.get("metadata") or {}
-    if not include_images and metadata.get("images"):
-        record["metadata"]["images"] = [
-            {"caption": img.get("caption", "")} for img in metadata["images"]
-        ]
+    def _strip_images(mem: Dict) -> None:
+        meta = mem.get("metadata") or {}
+        if meta.get("images"):
+            mem["metadata"]["images"] = [
+                {"caption": img.get("caption", "")} for img in meta["images"]
+            ]
+
+    if not include_images:
+        _strip_images(record)
+        # Also strip images from history entries
+        for hist_mem in record.get("history", []):
+            _strip_images(hist_mem)
 
     if fields:
         try:
@@ -1092,6 +1120,7 @@ async def memory_semantic_search(
     content_mode: str = "preview",
     preview_chars: int = 300,
     fields: Optional[List[str]] = None,
+    follow: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Perform a semantic search using vector embeddings.
 
@@ -1106,7 +1135,13 @@ async def memory_semantic_search(
         preview_chars: Max chars for preview (default: 300, ignored when content_mode="full")
         fields: Optional list of fields to return. Include "score" to keep {memory, score} envelope;
                 omit "score" for flat list of memory dicts.
+        follow: Lineage mode — "latest" resolves each result to its current version,
+                "active" excludes superseded memories, "full_history" expands supersession chains.
     """
+    try:
+        validate_follow(follow)
+    except ValueError as exc:
+        return {"error": "invalid_follow", "message": str(exc)}
 
     try:
         results = _semantic_search(
@@ -1114,6 +1149,7 @@ async def memory_semantic_search(
             metadata_filters,
             top_k,
             min_score,
+            follow=follow,
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
@@ -1149,6 +1185,7 @@ async def memory_hybrid_search(
     content_mode: str = "preview",
     preview_chars: int = 300,
     fields: Optional[List[str]] = None,
+    follow: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Perform a hybrid search combining keyword (FTS) and semantic (vector) search.
 
@@ -1174,10 +1211,16 @@ async def memory_hybrid_search(
         preview_chars: Max chars for preview (default: 300, ignored when content_mode="full")
         fields: Optional list of fields to return. Include "score" to keep {memory, score} envelope;
                 omit "score" for flat list of memory dicts.
+        follow: Lineage mode — "latest" resolves each result to its current version,
+                "active" excludes superseded memories, "full_history" expands supersession chains.
 
     Returns:
         Dictionary with count and list of results, each containing score and memory
     """
+    try:
+        validate_follow(follow)
+    except ValueError as exc:
+        return {"error": "invalid_follow", "message": str(exc)}
     try:
         results = _hybrid_search(
             query,
@@ -1190,6 +1233,7 @@ async def memory_hybrid_search(
             tags_any,
             tags_all,
             tags_none,
+            follow=follow,
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}

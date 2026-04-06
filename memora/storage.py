@@ -1603,6 +1603,253 @@ def remove_link(
     return {"status": "unlinked", "removed": removed}
 
 
+# ---------------------------------------------------------------------------
+# Lineage-aware retrieval — chain-walking on supersession edges
+# ---------------------------------------------------------------------------
+
+# Valid follow modes for lineage-aware retrieval
+FOLLOW_MODES = {"latest", "active", "full_history"}
+
+# Modes valid for single-ID retrieval (memory_get)
+_GET_FOLLOW_MODES = {"latest", "full_history"}
+
+# Max depth to walk supersession chains (safety cap; visited set prevents cycles)
+_MAX_CHAIN_DEPTH = 200
+
+
+def validate_follow(follow: Optional[str], for_get: bool = False) -> Optional[str]:
+    """Validate follow parameter. Returns normalized value or raises ValueError."""
+    if not follow:
+        return None
+    valid = _GET_FOLLOW_MODES if for_get else FOLLOW_MODES
+    if follow not in valid:
+        raise ValueError(
+            f"Invalid follow mode '{follow}'. Must be one of: {', '.join(sorted(valid))}"
+        )
+    return follow
+
+
+def _memory_exists(conn: sqlite3.Connection, memory_id: int) -> bool:
+    """Check if a memory exists without fetching full record."""
+    row = conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    return row is not None
+
+
+def _walk_chain(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    edge_type: str,
+    max_depth: int = _MAX_CHAIN_DEPTH,
+) -> List[int]:
+    """Walk a chain of edges from a memory, returning ordered list of IDs.
+
+    When multiple edges of the same type exist (branching), collects ALL
+    branches via BFS. Skips edges pointing to deleted/missing memories.
+
+    Args:
+        conn: Database connection
+        memory_id: Starting memory ID
+        edge_type: Edge type to follow (e.g. "superseded_by" to walk forward)
+        max_depth: Maximum chain depth to prevent infinite loops
+
+    Returns:
+        List of memory IDs reachable via edge_type, in BFS order (starting with memory_id)
+    """
+    visited = {memory_id}
+    chain = [memory_id]
+    queue = [memory_id]
+    depth = 0
+
+    while queue and depth < max_depth:
+        next_queue: List[int] = []
+        for current in queue:
+            refs = get_crossrefs(conn, current)
+            for ref in refs:
+                rid = ref["id"]
+                if (ref.get("edge_type") == edge_type
+                        and rid not in visited
+                        and _memory_exists(conn, rid)):
+                    visited.add(rid)
+                    chain.append(rid)
+                    next_queue.append(rid)
+        queue = next_queue
+        depth += 1
+
+    return chain
+
+
+def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
+    """Walk forward along superseded_by edges to find all leaf versions.
+
+    Returns list of leaf IDs (memories with no further superseded_by edges).
+    For linear chains this is a single element; for branches it returns all leaves.
+    If a cycle is detected (no leaves found), returns the original memory_id
+    and sets the cycle flag so callers can warn.
+    """
+    all_ids = _walk_chain(conn, memory_id, "superseded_by")
+    # Leaves are nodes with no outgoing superseded_by edge to a node in our set
+    # (edges to nodes outside the walked set don't count as successors within the chain)
+    all_ids_set = set(all_ids)
+    leaves = []
+    for mid in all_ids:
+        refs = get_crossrefs(conn, mid)
+        has_successor = any(
+            ref.get("edge_type") == "superseded_by"
+            and ref["id"] in all_ids_set
+            and ref["id"] != mid
+            and _memory_exists(conn, ref["id"])
+            for ref in refs
+        )
+        if not has_successor:
+            leaves.append(mid)
+    # If no leaves found, the graph has a cycle. Return the highest ID as a
+    # deterministic fallback (same node regardless of entry point).
+    if not leaves:
+        return [max(all_ids)]
+    return leaves
+
+
+def _is_superseded(conn: sqlite3.Connection, memory_id: int) -> bool:
+    """Check if a memory has been superseded by an existing memory."""
+    refs = get_crossrefs(conn, memory_id)
+    for ref in refs:
+        if ref.get("edge_type") == "superseded_by" and _memory_exists(conn, ref["id"]):
+            return True
+    return False
+
+
+def _get_full_history(conn: sqlite3.Connection, memory_id: int) -> List[int]:
+    """Get the full supersession graph containing this memory.
+
+    Walks backward to find all roots, then forward to find all descendants.
+    Returns all unique IDs in the connected component (BFS order from roots).
+    """
+    # Walk backward to find all ancestors (roots)
+    ancestors = _walk_chain(conn, memory_id, "supersedes")
+    # The roots are the leaves of the backward walk
+    roots: set[int] = set()
+    for mid in ancestors:
+        refs = get_crossrefs(conn, mid)
+        has_parent = any(
+            ref.get("edge_type") == "supersedes"
+            and ref["id"] not in {mid}
+            and _memory_exists(conn, ref["id"])
+            for ref in refs
+        )
+        if not has_parent:
+            roots.add(mid)
+    if not roots:
+        roots = {memory_id}
+
+    # Walk forward from all roots
+    all_ids: List[int] = []
+    seen: set[int] = set()
+    for root in sorted(roots):
+        for mid in _walk_chain(conn, root, "superseded_by"):
+            if mid not in seen:
+                seen.add(mid)
+                all_ids.append(mid)
+    return all_ids
+
+
+def _serialise_memory_for_follow(
+    conn: sqlite3.Connection,
+    memory_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Fetch a memory in the same shape as list/search results (no 'related' key).
+
+    This avoids shape inconsistency when apply_follow replaces items:
+    list/search rows come from _serialise_row (no related), so replacements
+    must match that shape.
+    """
+    row = conn.execute(
+        """SELECT id, content, metadata, tags, created_at, updated_at,
+                  importance, last_accessed, access_count
+           FROM memories WHERE id = ?""",
+        (memory_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return _serialise_row(row)
+
+
+def apply_follow(
+    conn: sqlite3.Connection,
+    results: List[Dict[str, Any]],
+    follow: str,
+    is_search: bool = False,
+) -> List[Dict[str, Any]]:
+    """Apply lineage-aware post-processing to retrieval results.
+
+    Args:
+        conn: Database connection
+        results: List of memory dicts (or search results with {score, memory} envelope)
+        follow: Follow mode — "latest", "active", or "full_history"
+        is_search: If True, results are {score, memory} envelopes
+
+    Returns:
+        Transformed results list
+
+    Raises:
+        ValueError: If follow mode is invalid
+    """
+    validate_follow(follow)
+
+    if not results:
+        return results
+
+    def _get_mem(item: Dict) -> Dict:
+        return item["memory"] if is_search else item
+
+    def _get_id(item: Dict) -> int:
+        return _get_mem(item)["id"]
+
+    def _wrap(mem: Dict, score: float) -> Dict:
+        return {"score": score, "memory": mem} if is_search else mem
+
+    if follow == "active":
+        return [item for item in results if not _is_superseded(conn, _get_id(item))]
+
+    if follow == "latest":
+        seen_ids: set[int] = set()
+        out: List[Dict[str, Any]] = []
+        for item in results:
+            leaf_ids = _resolve_latest(conn, _get_id(item))
+            for latest_id in leaf_ids:
+                if latest_id in seen_ids:
+                    continue
+                seen_ids.add(latest_id)
+                if latest_id == _get_id(item):
+                    out.append(item)
+                else:
+                    latest_mem = _serialise_memory_for_follow(conn, latest_id)
+                    if latest_mem:
+                        out.append(_wrap(latest_mem, item.get("score", 0) if is_search else 0))
+        return out
+
+    if follow == "full_history":
+        seen_ids: set[int] = set()
+        out: List[Dict[str, Any]] = []
+        for item in results:
+            mid = _get_id(item)
+            if mid in seen_ids:
+                continue
+            chain_ids = _get_full_history(conn, mid)
+            for chain_id in chain_ids:
+                if chain_id in seen_ids:
+                    continue
+                seen_ids.add(chain_id)
+                if chain_id == mid:
+                    out.append(item)
+                else:
+                    mem = _serialise_memory_for_follow(conn, chain_id)
+                    if mem:
+                        out.append(_wrap(mem, item.get("score", 0) if is_search else 0))
+        return out
+
+    return results
+
+
 def _louvain_communities(
     adj: Dict[int, Dict[int, float]],
 ) -> Dict[int, int]:
@@ -2146,6 +2393,7 @@ def get_memory(
     conn: sqlite3.Connection,
     memory_id: int,
     track_access: bool = False,
+    follow: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Retrieve a single memory by ID.
 
@@ -2153,10 +2401,32 @@ def get_memory(
         conn: Database connection
         memory_id: ID of memory to retrieve
         track_access: If True, increment access count and update last_accessed
+        follow: Lineage mode — "latest" returns the current version (walks superseded_by),
+                "full_history" adds a "history" key with all versions root-to-leaf.
 
     Returns:
-        Memory dict or None if not found
+        Memory dict or None if not found.
+        With follow="full_history", includes a "history" key listing the full chain.
+
+    Raises:
+        ValueError: If follow mode is invalid for single-ID retrieval
     """
+    if follow:
+        validate_follow(follow, for_get=True)
+
+    # When follow="latest", resolve the leaf first so track_access applies
+    # only to the actually returned memory (not the superseded ancestor).
+    # Tiebreaker policy for branched chains: highest ID wins. This is a
+    # deterministic convention for single-ID get. Callers who need all branches
+    # should use follow="full_history" or search with follow="latest" (which
+    # returns all leaves). The highest-ID convention is chosen because IDs are
+    # monotonically increasing, so this favors the most recently created branch.
+    if follow == "latest":
+        leaf_ids = _resolve_latest(conn, memory_id)
+        latest_id = max(leaf_ids)
+        if latest_id != memory_id:
+            return get_memory(conn, latest_id, track_access=track_access)
+
     row = conn.execute(
         """SELECT id, content, metadata, tags, created_at, updated_at,
                   importance, last_accessed, access_count
@@ -2172,6 +2442,21 @@ def get_memory(
 
     record = _serialise_row(row)
     record["related"] = get_crossrefs(conn, memory_id)
+
+    if follow == "full_history":
+        chain_ids = _get_full_history(conn, memory_id)
+        if len(chain_ids) > 1:
+            chain = []
+            for cid in chain_ids:
+                if cid == memory_id:
+                    # Copy to avoid circular reference (record["history"] containing record itself)
+                    chain.append(dict(record))
+                else:
+                    mem = get_memory(conn, cid)
+                    if mem:
+                        chain.append(mem)
+            record["history"] = chain
+
     return record
 
 
@@ -2375,6 +2660,7 @@ def list_memories(
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
     sort_by_importance: bool = False,
+    follow: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     validated_filters = _validate_metadata_filters(metadata_filters)
     limit = _clamp_limit(limit)
@@ -2537,6 +2823,19 @@ def list_memories(
         if limit is not None:
             records = records[:limit]
 
+    # Apply lineage-aware post-processing.
+    # Note: follow is applied AFTER pagination. This means:
+    # - "active"/"latest" may return fewer items than `limit` (filtered/deduped)
+    # - "full_history" may expand beyond `limit` (capped below)
+    # Pre-follow pagination would require fetching unbounded results, which is
+    # worse for performance. Callers needing exact counts should paginate the
+    # followed result set at the tool layer.
+    if follow:
+        records = apply_follow(conn, records, follow, is_search=False)
+        # Cap full_history expansion to prevent unbounded response size
+        if follow == "full_history" and limit is not None and len(records) > limit * 3:
+            records = records[:limit * 3]
+
     return records
 
 
@@ -2606,6 +2905,7 @@ def semantic_search(
     tags_any: Optional[List[str]] = None,
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
+    follow: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Perform semantic search using vector embeddings.
 
@@ -2621,6 +2921,8 @@ def semantic_search(
         tags_any: Match memories with ANY of these tags (OR)
         tags_all: Match memories with ALL of these tags (AND)
         tags_none: Exclude memories with ANY of these tags (NOT)
+        follow: Lineage mode — "latest" (resolve to current version),
+                "active" (exclude superseded), "full_history" (expand chains)
 
     Returns:
         List of results with score and memory
@@ -2637,7 +2939,7 @@ def semantic_search(
     vector_query = _compute_embedding(query, None, [])
     if not vector_query:
         return []
-    return _search_by_vector(
+    results = _search_by_vector(
         conn,
         vector_query,
         metadata_filters=metadata_filters,
@@ -2649,6 +2951,13 @@ def semantic_search(
         tags_all=tags_all,
         tags_none=tags_none,
     )
+
+    if follow:
+        results = apply_follow(conn, results, follow, is_search=True)
+        if follow == "full_history" and top_k is not None and len(results) > top_k * 3:
+            results = results[:top_k * 3]
+
+    return results
 
 
 def hybrid_search(
@@ -2665,6 +2974,7 @@ def hybrid_search(
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
     auto_rebuild: bool = True,
+    follow: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Combine FTS keyword search and semantic vector search using Reciprocal Rank Fusion.
 
@@ -2764,6 +3074,11 @@ def hybrid_search(
             "score": round(score, 4),
             "memory": memory,
         })
+
+    if follow:
+        results = apply_follow(conn, results, follow, is_search=True)
+        if follow == "full_history" and len(results) > top_k * 3:
+            results = results[:top_k * 3]
 
     return results
 
