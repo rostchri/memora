@@ -706,11 +706,102 @@ async def memory_create_section(
     return {"memory": record}
 
 
+_FIELDS_UNIVERSAL = frozenset({
+    "id", "content", "content_preview", "tags", "created_at", "updated_at",
+    "metadata", "importance", "importance_score", "last_accessed", "access_count",
+})
+_FIELDS_SEARCH_ONLY = frozenset({"score"})
+_FIELDS_ALL = _FIELDS_UNIVERSAL | _FIELDS_SEARCH_ONLY
+
+
+def _project_fields(
+    memory_dict: Dict[str, Any],
+    fields: Optional[List[str]],
+    *,
+    is_search: bool = False,
+) -> Dict[str, Any]:
+    """Project a serialised memory dict to only the requested fields.
+
+    ``id`` is always included. Unknown field names raise ValueError.
+    ``score`` is rejected for non-search tools.
+    """
+    if not fields:
+        return memory_dict
+
+    requested = set(fields)
+    allowed = _FIELDS_ALL if is_search else _FIELDS_UNIVERSAL
+    unknown = requested - allowed
+    if unknown:
+        # Check if it's a search-only field used on a non-search tool
+        search_only_misuse = unknown & _FIELDS_SEARCH_ONLY
+        if search_only_misuse and not is_search:
+            raise ValueError(
+                f"Field(s) {sorted(search_only_misuse)} are only available on search tools, "
+                f"not on memory_list or memory_get"
+            )
+        truly_unknown = unknown - _FIELDS_SEARCH_ONLY
+        if truly_unknown:
+            raise ValueError(f"Unknown field(s): {sorted(truly_unknown)}")
+
+    # Always include id
+    requested.add("id")
+
+    # Forgiving content auto-promotion: if caller asked for the "other" content
+    # variant that wasn't materialised, swap in the one that exists.
+    has_content = "content" in memory_dict
+    has_preview = "content_preview" in memory_dict
+    warning = None
+
+    if "content" in requested and not has_content and has_preview:
+        requested.discard("content")
+        requested.add("content_preview")
+        warning = "fields requested 'content' but content_mode=preview; returned content_preview instead"
+    elif "content_preview" in requested and not has_preview and has_content:
+        requested.discard("content_preview")
+        requested.add("content")
+        warning = "fields requested 'content_preview' but content_mode=full; returned content instead"
+
+    projected = {k: v for k, v in memory_dict.items() if k in requested}
+    if warning:
+        projected["_field_warning"] = warning
+    return projected
+
+
+def _apply_content_projection(
+    items: List[Dict[str, Any]],
+    content_mode: str = "preview",
+    preview_chars: int = 200,
+) -> List[Dict[str, Any]]:
+    """Project content fields on already-serialised memory dicts.
+
+    Applied at the **tool boundary** — ``_serialise_row`` always keeps full
+    ``content`` so internal code (``_search_by_vector``, crossref scan) still
+    works.
+
+    When ``content_mode="preview"`` the ``content`` key is replaced by
+    ``content_preview`` (first ``preview_chars`` chars + trailing ``…`` if
+    truncated).  When ``content_mode="full"`` the row is returned unchanged.
+    """
+    if content_mode == "full":
+        return items
+
+    projected: List[Dict[str, Any]] = []
+    for item in items:
+        row = dict(item)  # shallow copy
+        full = row.pop("content", "") or ""
+        if len(full) > preview_chars:
+            row["content_preview"] = full[:preview_chars] + "…"
+        else:
+            row["content_preview"] = full
+        projected.append(row)
+    return projected
+
+
 @mcp.tool()
 async def memory_list(
     query: Optional[str] = None,
     metadata_filters: Optional[Dict[str, Any]] = None,
-    limit: Optional[int] = None,
+    limit: Optional[int] = 20,
     offset: Optional[int] = 0,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -718,20 +809,30 @@ async def memory_list(
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
     sort_by_importance: bool = False,
+    content_mode: str = "preview",
+    preview_chars: int = 120,
+    fields: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """List memories, optionally filtering by substring query or metadata.
+
+    Returns compact previews by default to reduce context usage.
+    Use ``content_mode="full"`` when you need the complete content.
+    Use ``memory_get`` to fetch full content for specific IDs.
 
     Args:
         query: Optional text search query
         metadata_filters: Optional metadata filters
-        limit: Maximum number of results to return (default: unlimited)
-        offset: Number of results to skip (default: 0)
+        limit: Maximum results (default: 20). Pass -1 for unlimited.
+        offset: Number of filtered results to skip (default: 0)
         date_from: Optional date filter (ISO format or relative like "7d", "1m", "1y")
         date_to: Optional date filter (ISO format or relative like "7d", "1m", "1y")
         tags_any: Match memories with ANY of these tags (OR logic)
         tags_all: Match memories with ALL of these tags (AND logic)
         tags_none: Exclude memories with ANY of these tags (NOT logic)
         sort_by_importance: Sort results by importance score (default: False, sorts by date)
+        content_mode: "preview" (default) returns truncated content_preview; "full" returns complete content
+        preview_chars: Max chars for preview (default: 120, ignored when content_mode="full")
+        fields: Optional list of fields to return (e.g. ["id","content_preview","tags"]). None returns all fields.
     """
     try:
         items = _list_memories(
@@ -741,7 +842,23 @@ async def memory_list(
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
-    return {"count": len(items), "memories": items}
+    items = _apply_content_projection(items, content_mode, preview_chars)
+    response: Dict[str, Any] = {"count": len(items)}
+    if fields:
+        try:
+            items = [_project_fields(item, fields, is_search=False) for item in items]
+        except ValueError as exc:
+            return {"error": "invalid_fields", "message": str(exc)}
+        # Hoist per-item warnings to envelope level and remove from items
+        warnings = set()
+        for item in items:
+            w = item.pop("_field_warning", None)
+            if w:
+                warnings.add(w)
+        if warnings:
+            response["warning"] = "; ".join(sorted(warnings))
+    response["memories"] = items
+    return response
 
 
 @mcp.tool()
@@ -756,10 +873,12 @@ async def memory_list_compact(
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """List memories in compact format (id, preview, tags only) to reduce context usage.
+    """[Deprecated] List memories in compact format (id, preview, tags only).
+
+    Prefer ``memory_list`` which now defaults to compact previews with richer
+    fields and configurable ``content_mode``/``preview_chars``.
 
     Returns minimal fields: id, content preview (first 80 chars), tags, and created_at.
-    This tool is useful for browsing memories without loading full content and metadata.
 
     Args:
         query: Optional text search query
@@ -811,13 +930,48 @@ async def memory_delete_batch(ids: List[int]) -> Dict[str, Any]:
     return {"deleted": deleted}
 
 
+def _apply_search_fields_projection(
+    results: List[Dict[str, Any]],
+    fields: List[str],
+) -> tuple:
+    """Project fields on search results ([{memory, score}, ...]).
+
+    If ``"score"`` is in ``fields``, keep the ``{memory, score}`` envelope.
+    Otherwise, flatten to a list of projected memory dicts (score dropped).
+
+    Returns ``(projected_results, warning_or_none)``.
+    """
+    requested = set(fields)
+    include_score = "score" in requested
+
+    warnings = set()
+    projected = []
+    for entry in results:
+        memory = entry.get("memory", entry)
+        mem_projected = _project_fields(memory, fields, is_search=True)
+        w = mem_projected.pop("_field_warning", None)
+        if w:
+            warnings.add(w)
+        if include_score:
+            projected.append({"memory": mem_projected, "score": entry.get("score")})
+        else:
+            projected.append(mem_projected)
+    warning = "; ".join(sorted(warnings)) if warnings else None
+    return projected, warning
+
+
 @mcp.tool()
-async def memory_get(memory_id: int, include_images: bool = False) -> Dict[str, Any]:
-    """Retrieve a single memory by id.
+async def memory_get(
+    memory_id: int,
+    include_images: bool = False,
+    fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Retrieve a single memory by id (full content by default).
 
     Args:
         memory_id: ID of the memory to retrieve
         include_images: If False, strip image data from metadata to reduce response size
+        fields: Optional list of fields to return (e.g. ["id","content","tags"]). None returns all fields.
     """
     record = _get_memory(memory_id)
     if not record:
@@ -829,7 +983,17 @@ async def memory_get(memory_id: int, include_images: bool = False) -> Dict[str, 
             {"caption": img.get("caption", "")} for img in metadata["images"]
         ]
 
-    return {"memory": record}
+    if fields:
+        try:
+            record = _project_fields(record, fields, is_search=False)
+        except ValueError as exc:
+            return {"error": "invalid_fields", "message": str(exc)}
+
+    response: Dict[str, Any] = {"memory": record}
+    w = record.pop("_field_warning", None) if isinstance(record, dict) else None
+    if w:
+        response["warning"] = w
+    return response
 
 
 @mcp.tool()
@@ -925,8 +1089,24 @@ async def memory_semantic_search(
     top_k: int = 5,
     metadata_filters: Optional[Dict[str, Any]] = None,
     min_score: Optional[float] = None,
+    content_mode: str = "preview",
+    preview_chars: int = 300,
+    fields: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Perform a semantic search using vector embeddings."""
+    """Perform a semantic search using vector embeddings.
+
+    Returns compact previews by default. Use content_mode="full" for complete content.
+
+    Args:
+        query: Search query text
+        top_k: Maximum number of results (default: 5)
+        metadata_filters: Optional metadata filters
+        min_score: Minimum similarity score threshold
+        content_mode: "preview" (default) returns truncated content_preview; "full" returns complete content
+        preview_chars: Max chars for preview (default: 300, ignored when content_mode="full")
+        fields: Optional list of fields to return. Include "score" to keep {memory, score} envelope;
+                omit "score" for flat list of memory dicts.
+    """
 
     try:
         results = _semantic_search(
@@ -937,7 +1117,21 @@ async def memory_semantic_search(
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
-    return {"count": len(results), "results": results}
+    # Project content at tool boundary — search results are [{score, memory}, ...]
+    for entry in results:
+        if "memory" in entry:
+            [projected] = _apply_content_projection([entry["memory"]], content_mode, preview_chars)
+            entry["memory"] = projected
+    response: Dict[str, Any] = {"count": len(results)}
+    if fields:
+        try:
+            results, warning = _apply_search_fields_projection(results, fields)
+        except ValueError as exc:
+            return {"error": "invalid_fields", "message": str(exc)}
+        if warning:
+            response["warning"] = warning
+    response["results"] = results
+    return response
 
 
 @mcp.tool()
@@ -952,11 +1146,17 @@ async def memory_hybrid_search(
     tags_any: Optional[List[str]] = None,
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
+    content_mode: str = "preview",
+    preview_chars: int = 300,
+    fields: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Perform a hybrid search combining keyword (FTS) and semantic (vector) search.
 
     Uses Reciprocal Rank Fusion (RRF) to merge results from both search methods,
     providing better results than either method alone.
+
+    Returns compact previews by default. Use content_mode="full" for complete content.
+    Use memory_get to fetch full content for specific IDs.
 
     Args:
         query: Search query text
@@ -970,6 +1170,10 @@ async def memory_hybrid_search(
         tags_any: Match memories with ANY of these tags (OR logic)
         tags_all: Match memories with ALL of these tags (AND logic)
         tags_none: Exclude memories with ANY of these tags (NOT logic)
+        content_mode: "preview" (default) returns truncated content_preview; "full" returns complete content
+        preview_chars: Max chars for preview (default: 300, ignored when content_mode="full")
+        fields: Optional list of fields to return. Include "score" to keep {memory, score} envelope;
+                omit "score" for flat list of memory dicts.
 
     Returns:
         Dictionary with count and list of results, each containing score and memory
@@ -989,7 +1193,21 @@ async def memory_hybrid_search(
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
-    return {"count": len(results), "results": results}
+    # Project content at tool boundary — search results are [{score, memory}, ...]
+    for entry in results:
+        if "memory" in entry:
+            [projected] = _apply_content_projection([entry["memory"]], content_mode, preview_chars)
+            entry["memory"] = projected
+    response: Dict[str, Any] = {"count": len(results)}
+    if fields:
+        try:
+            results, warning = _apply_search_fields_projection(results, fields)
+        except ValueError as exc:
+            return {"error": "invalid_fields", "message": str(exc)}
+        if warning:
+            response["warning"] = warning
+    response["results"] = results
+    return response
 
 
 @mcp.tool()

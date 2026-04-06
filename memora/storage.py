@@ -1132,8 +1132,14 @@ def _safe_order_clause(column: str = "created_at", direction: str = "DESC", quer
 
 
 def _clamp_limit(limit: Optional[int]) -> Optional[int]:
-    """Clamp LIMIT to safe bounds."""
-    if limit is None:
+    """Clamp LIMIT to safe bounds.
+
+    Sentinel values:
+    - ``None`` — no SQL LIMIT (unlimited, legacy behavior)
+    - ``-1``   — explicit unlimited (same effect as None, but opt-in)
+    - ``0``    — treated as 1 (minimum)
+    """
+    if limit is None or limit == -1:
         return None
     return max(1, min(int(limit), _MAX_LIMIT))
 
@@ -1266,6 +1272,39 @@ def _iter_memories_with_embeddings(
             return
 
 
+def _record_passes_date_tag_filters(
+    record: Dict[str, Any],
+    *,
+    parsed_date_from: Optional[str] = None,
+    parsed_date_to: Optional[str] = None,
+    tags_any: Optional[List[str]] = None,
+    tags_all: Optional[List[str]] = None,
+    tags_none: Optional[List[str]] = None,
+) -> bool:
+    """Apply date/tag filters to an already-serialised memory record.
+
+    Mirrors the logic in ``list_memories`` at the tag-filter block so both
+    retrieval legs (keyword + semantic) enforce filters uniformly. Caller
+    supplies already-parsed ISO date strings (see ``_parse_date_filter``).
+    """
+    created_at = record.get("created_at") or ""
+    if parsed_date_from and created_at and created_at < parsed_date_from:
+        return False
+    if parsed_date_to and created_at and created_at > parsed_date_to:
+        return False
+
+    record_tags = set(record.get("tags") or [])
+
+    if tags_any and not any(tag in record_tags for tag in tags_any):
+        return False
+    if tags_all and not all(tag in record_tags for tag in tags_all):
+        return False
+    if tags_none and any(tag in record_tags for tag in tags_none):
+        return False
+
+    return True
+
+
 def _search_by_vector(
     conn: sqlite3.Connection,
     vector_query: Dict[str, float],
@@ -1274,9 +1313,16 @@ def _search_by_vector(
     top_k: Optional[int] = 5,
     min_score: Optional[float] = None,
     exclude_ids: Optional[Iterable[int]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    tags_any: Optional[List[str]] = None,
+    tags_all: Optional[List[str]] = None,
+    tags_none: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     exclude_set = set(exclude_ids or [])
     validated_filters = _validate_metadata_filters(metadata_filters) if metadata_filters else None
+    parsed_date_from = _parse_date_filter(date_from) if date_from else None
+    parsed_date_to = _parse_date_filter(date_to) if date_to else None
 
     results: List[Dict[str, Any]] = []
     for row, vector in _iter_memories_with_embeddings(conn):
@@ -1289,6 +1335,19 @@ def _search_by_vector(
         # Apply metadata filters in Python, matching list_memories() semantics.
         if validated_filters and not _metadata_matches_filters(
             record.get("metadata"), validated_filters
+        ):
+            continue
+
+        # Phase 0: apply date + tag filters uniformly across both retrieval legs.
+        # Must run BEFORE the vector score computation and top-k truncation so
+        # selective filters still surface matching rows from the semantic leg.
+        if not _record_passes_date_tag_filters(
+            record,
+            parsed_date_from=parsed_date_from,
+            parsed_date_to=parsed_date_to,
+            tags_any=tags_any,
+            tags_all=tags_all,
+            tags_none=tags_none,
         ):
             continue
 
@@ -2301,6 +2360,9 @@ def _parse_date_filter(date_str: str) -> str:
     raise ValueError(f"Invalid date format: {date_str}")
 
 
+_SCAN_CAP = 5000
+
+
 def list_memories(
     conn: sqlite3.Connection,
     query: Optional[str] = None,
@@ -2316,7 +2378,13 @@ def list_memories(
 ) -> List[Dict[str, Any]]:
     validated_filters = _validate_metadata_filters(metadata_filters)
     limit = _clamp_limit(limit)
-    offset = _clamp_offset(offset)
+    offset = _clamp_offset(offset) or 0
+
+    # When post-SQL filters are active (tags_*/metadata_filters), SQL
+    # LIMIT/OFFSET would truncate BEFORE filtering, giving wrong pagination.
+    # In that case: fetch up to _SCAN_CAP rows from SQL (no LIMIT/OFFSET),
+    # filter in Python, then apply offset/limit to filtered results.
+    has_post_sql_filters = bool(validated_filters or tags_any or tags_all or tags_none)
 
     rows: List[sqlite3.Row]
 
@@ -2338,10 +2406,14 @@ def list_memories(
         date_clause_plain += " AND created_at <= ?"
         date_params.append(parsed_date_to)
 
-    # Build LIMIT/OFFSET clause
+    # Build LIMIT/OFFSET clause — skip when post-SQL filters are active
     limit_clause = ""
     limit_params = []
-    if limit is not None:
+    if has_post_sql_filters:
+        # Fetch up to scan cap; filtering + offset/limit applied in Python below
+        limit_clause = " LIMIT ?"
+        limit_params.append(_SCAN_CAP)
+    elif limit is not None:
         limit_clause = " LIMIT ?"
         limit_params.append(limit)
         if offset:
@@ -2457,6 +2529,14 @@ def list_memories(
     if sort_by_importance:
         records.sort(key=lambda r: r.get("importance_score", 0.0), reverse=True)
 
+    # When post-SQL filters were active, apply offset/limit to filtered results
+    # (SQL LIMIT/OFFSET was skipped to avoid pre-filter truncation).
+    if has_post_sql_filters:
+        if offset:
+            records = records[offset:]
+        if limit is not None:
+            records = records[:limit]
+
     return records
 
 
@@ -2521,6 +2601,11 @@ def semantic_search(
     top_k: Optional[int] = 5,
     min_score: Optional[float] = None,
     auto_rebuild: bool = True,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    tags_any: Optional[List[str]] = None,
+    tags_all: Optional[List[str]] = None,
+    tags_none: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Perform semantic search using vector embeddings.
 
@@ -2531,6 +2616,11 @@ def semantic_search(
         top_k: Maximum number of results
         min_score: Minimum similarity score threshold
         auto_rebuild: If True, automatically rebuild embeddings on model mismatch
+        date_from: Optional ISO date or relative ("7d", "1m") lower bound
+        date_to: Optional ISO date or relative upper bound
+        tags_any: Match memories with ANY of these tags (OR)
+        tags_all: Match memories with ALL of these tags (AND)
+        tags_none: Exclude memories with ANY of these tags (NOT)
 
     Returns:
         List of results with score and memory
@@ -2553,6 +2643,11 @@ def semantic_search(
         metadata_filters=metadata_filters,
         top_k=top_k,
         min_score=min_score,
+        date_from=date_from,
+        date_to=date_to,
+        tags_any=tags_any,
+        tags_all=tags_all,
+        tags_none=tags_none,
     )
 
 
@@ -2598,6 +2693,8 @@ def hybrid_search(
     keyword_weight = 1.0 - semantic_weight
 
     # 1. Get semantic search results (fetch more than top_k for better fusion)
+    # Phase 0: pass the full filter set so the semantic leg honors the same
+    # date/tag constraints as the keyword leg at query time (not post-fusion).
     semantic_results = semantic_search(
         conn,
         query,
@@ -2605,6 +2702,11 @@ def hybrid_search(
         top_k=top_k * 3,
         min_score=None,  # Get all results, filter after fusion
         auto_rebuild=auto_rebuild,
+        date_from=date_from,
+        date_to=date_to,
+        tags_any=tags_any,
+        tags_all=tags_all,
+        tags_none=tags_none,
     )
 
     # 2. Get keyword search results

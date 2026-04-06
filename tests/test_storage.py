@@ -106,6 +106,130 @@ def test_semantic_search_basic(local_db):
         assert any("python" in r["memory"]["content"].lower() for r in results)
 
 
+def test_hybrid_search_tags_all_filters_semantic_leg(local_db):
+    """Phase 0 regression: tags_all must filter both legs of hybrid_search.
+
+    Before the fix, the semantic leg only honored metadata_filters, so fused
+    results could include rows that violated tags_all.
+    """
+    with storage.connect() as conn:
+        storage.add_memory(conn, content="Python programming language overview", tags=["a", "b"])
+        storage.add_memory(conn, content="Python programming basics intro", tags=["a"])
+        storage.add_memory(conn, content="Python programming advanced patterns", tags=["b"])
+
+        results = storage.hybrid_search(conn, "python programming", tags_all=["a", "b"])
+
+        assert len(results) >= 1
+        for entry in results:
+            memory = entry.get("memory", entry)
+            tags = set(memory.get("tags") or [])
+            assert {"a", "b"}.issubset(tags), (
+                f"hybrid_search returned row with tags {tags} violating tags_all=['a','b']"
+            )
+
+
+def test_hybrid_search_selective_tag_filter_surfaces_matches(local_db):
+    """Phase 0 regression: selective filters must still surface the matching row
+    from the semantic leg even when it would lie outside the unfiltered top-k.
+    """
+    with storage.connect() as conn:
+        # Populate many non-matching rows to push the needle below the default
+        # top_k * 3 window for semantic search.
+        for i in range(20):
+            storage.add_memory(
+                conn,
+                content=f"Distractor document about python programming number {i}",
+                tags=["distract"],
+            )
+        # The single row that should match the filter.
+        storage.add_memory(
+            conn,
+            content="Rare needle memory for python programming query",
+            tags=["needle"],
+        )
+
+        results = storage.hybrid_search(
+            conn, "python programming", tags_all=["needle"], top_k=5
+        )
+
+        assert len(results) == 1, (
+            f"Expected 1 needle row, got {len(results)} — filter did not push "
+            f"into semantic leg"
+        )
+        memory = results[0].get("memory", results[0])
+        assert "needle" in (memory.get("tags") or [])
+
+
+def test_hybrid_search_date_filter_applies_to_semantic_leg(local_db):
+    """Phase 0 regression: date_from/date_to must filter the semantic leg."""
+    import sqlite3 as _sqlite3
+
+    with storage.connect() as conn:
+        old = storage.add_memory(
+            conn, content="Python programming early historical note", tags=["old"]
+        )
+        new = storage.add_memory(
+            conn, content="Python programming recent current note", tags=["new"]
+        )
+
+        # Force the old row's created_at backward so date_from filters it out.
+        conn.execute(
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            ("2020-01-01T00:00:00", old["id"]),
+        )
+        conn.commit()
+
+        results = storage.hybrid_search(
+            conn, "python programming", date_from="2024-01-01T00:00:00"
+        )
+
+        ids = {entry.get("memory", entry)["id"] for entry in results}
+        assert new["id"] in ids
+        assert old["id"] not in ids, (
+            "hybrid_search returned a row older than date_from — semantic leg "
+            "ignored the date filter"
+        )
+
+
+def test_list_memories_filtered_pagination(local_db):
+    """Phase 1 regression: offset/limit must apply to filtered results, not raw SQL rows.
+
+    Before the fix, SQL LIMIT/OFFSET ran before Python-side tag filtering,
+    so filtered pagination underfilled and offset skipped wrong rows.
+    """
+    with storage.connect() as conn:
+        # Create 20 memories: 10 matching (tags=["match"]) and 10 non-matching
+        for i in range(20):
+            tag = "match" if i % 2 == 0 else "nomatch"
+            storage.add_memory(
+                conn,
+                content=f"Filtered pagination test memory number {i:02d}",
+                tags=[tag],
+            )
+
+        # Without filters: 20 total. With tags_all=["match"]: 10 matching.
+        all_matching = storage.list_memories(conn, tags_all=["match"], limit=-1)
+        assert len(all_matching) == 10
+
+        # Page 1: first 5 filtered results
+        page1 = storage.list_memories(conn, tags_all=["match"], limit=5, offset=0)
+        assert len(page1) == 5, f"Page 1 expected 5 rows, got {len(page1)}"
+
+        # Page 2: next 5 filtered results
+        page2 = storage.list_memories(conn, tags_all=["match"], limit=5, offset=5)
+        assert len(page2) == 5, f"Page 2 expected 5 rows, got {len(page2)}"
+
+        # Pages should not overlap and should cover all 10 matching rows
+        page1_ids = {r["id"] for r in page1}
+        page2_ids = {r["id"] for r in page2}
+        assert page1_ids.isdisjoint(page2_ids), "Pages overlap"
+        assert len(page1_ids | page2_ids) == 10, "Pages don't cover all matches"
+
+        # All returned rows must have the "match" tag
+        for r in page1 + page2:
+            assert "match" in r["tags"], f"Row {r['id']} missing 'match' tag"
+
+
 def test_tag_whitelist_enforcement(local_db, monkeypatch):
     """Adding memory with invalid tag should raise when whitelist is active."""
     monkeypatch.setattr(memora, "TAG_WHITELIST", {"allowed-tag"})
