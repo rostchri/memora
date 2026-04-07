@@ -238,3 +238,7 @@ def _ensure_updated_at_column(conn: sqlite3.Connection) -> None:
     if "updated_at" not in columns:
         conn.execute("ALTER TABLE memories ADD COLUMN updated_at TEXT")
         conn.commit()
+
+
+    # Note: memory_absorb stores source/confidence in metadata (not separate columns)
+    # to avoid schema migration and keep provenance co-located with other metadata.

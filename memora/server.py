@@ -21,6 +21,7 @@ from .hierarchy import (
 )
 from .storage import (
     _redact_secrets,
+    absorb_memory,
     add_link,
     add_memories,
     add_memory,
@@ -267,6 +268,29 @@ def _boost_memory(conn, memory_id: int, boost_amount: float):
 @_with_connection(writes=True)
 def _create_memories(conn, entries: List[Dict[str, Any]]):
     return add_memories(conn, entries)
+
+
+@_with_connection(writes=True)
+def _absorb_memory(
+    conn,
+    facts: List[str],
+    source: str,
+    confidence: float,
+    context: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+    tags: Optional[List[str]],
+    dry_run: bool,
+):
+    return absorb_memory(
+        conn,
+        facts,
+        source=source,
+        confidence=confidence,
+        context=context,
+        metadata=metadata,
+        tags=tags,
+        dry_run=dry_run,
+    )
 
 
 @_with_connection(writes=True)
@@ -943,6 +967,54 @@ async def memory_delete_batch(ids: List[int]) -> Dict[str, Any]:
     deleted = _delete_memories(ids)
     _schedule_cloud_graph_sync()
     return {"deleted": deleted}
+
+
+@mcp.tool()
+async def memory_absorb(
+    facts: List[str],
+    source: str = "manual",
+    confidence: float = 0.8,
+    context: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    tags: Optional[list[str]] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Intelligently absorb facts into memory with automatic deduplication.
+
+    For each fact: searches for similar existing memories, classifies the
+    relationship via LLM (duplicate/update/contradict/related/new), then
+    takes the appropriate action. Use this instead of memory_create when
+    saving knowledge that may overlap with existing memories.
+
+    Args:
+        facts: List of atomic fact strings to absorb (one topic per fact)
+        source: Origin of facts — "manual", "session_end", "post_tool", "import"
+        confidence: Caller's certainty about these facts (0.0-1.0, default: 0.8)
+        context: Optional surrounding context to help disambiguate facts
+        metadata: Optional metadata to attach to created memories
+        tags: Optional tags to attach to created memories
+        dry_run: If True, preview what would happen without writing anything
+    """
+    if not facts:
+        return {"error": "invalid_input", "message": "facts list is empty"}
+    if len(facts) > 20:
+        return {"error": "invalid_input", "message": "max 20 facts per call"}
+
+    try:
+        result = _absorb_memory(
+            facts, source, confidence, context, metadata, tags, dry_run,
+        )
+    except ValueError as exc:
+        return {"error": "invalid_input", "message": str(exc)}
+    except Exception as exc:
+        logger.error("memory_absorb failed: %s", exc, exc_info=True)
+        return _safe_error(exc, "memory_absorb")
+
+    wrote = result.get("created", 0) + result.get("superseded", 0) + result.get("contradicted", 0) + result.get("linked", 0)
+    if not dry_run and wrote > 0:
+        _schedule_cloud_graph_sync()
+
+    return result
 
 
 def _apply_search_fields_projection(

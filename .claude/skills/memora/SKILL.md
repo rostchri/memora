@@ -1,7 +1,7 @@
 ---
 name: memora
 description: Persistent memory and knowledge management. Use at session start to load context, when the user asks about past work or stored knowledge, and when saving important information for future sessions.
-user-invocable: false
+user-invocable: true
 ---
 
 ## Session Start

@@ -36,23 +36,34 @@ memory_get(memory_id=170, follow="full_history")  # returns history: [#157, #170
 
 **When to skip `follow`:** When you need raw results regardless of supersession state (e.g., debugging, auditing, or examining the full unfiltered store).
 
-### Creating memories
+### Saving knowledge — use `memory_absorb`
 
-- Use `memory_create` for new knowledge. Keep content atomic — one topic per memory.
-- Use `response_mode="minimal"` to reduce token overhead on create.
-- Set appropriate metadata: `type` (issue, todo, research, reference), `hierarchy.path`, `section`, `subsection`.
-- Review `similar_memories` in the response — consider linking or superseding instead of duplicating.
+**Prefer `memory_absorb` over `memory_create` when saving knowledge.** Absorb automatically checks for duplicates, supersedes outdated memories, and links related ones.
 
-### Updating and superseding
+```
+memory_absorb(
+    facts=["The auth rewrite is driven by legal compliance", "D1 backend now supports bookmarks"],
+    source="manual",
+    tags=["memora/knowledge"]
+)
+```
 
-When information evolves, prefer **supersession over editing**:
+Absorb handles dedup automatically:
+- **Duplicate** → skipped (no new memory created)
+- **Update** → creates new memory + supersedes the old one
+- **Contradiction** → creates new memory + links with contradicts edge
+- **Related** → creates new memory + links with related_to edge
+- **New** → creates new memory (no matches found)
 
-1. Create the new memory with updated content
-2. Link it: `memory_link(from_id=new, to_id=old, edge_type="supersedes")`
+Use `dry_run=True` to preview what absorb would do without writing.
 
-This preserves history. The old memory remains accessible via `follow="full_history"` but is automatically filtered out by `follow="active"` and resolved through by `follow="latest"`.
+**Use `memory_create` directly only for:**
+- Raw/unprocessed content you want stored verbatim
+- Structured entries (TODOs, issues, sections) via `memory_create_todo`, `memory_create_issue`, `memory_create_section`
 
-**Use `memory_update` only for corrections** (typos, metadata fixes) — not for evolving knowledge.
+### Updating memories
+
+**Use `memory_update` only for corrections** (typos, metadata fixes) — not for evolving knowledge. For evolving knowledge, use `memory_absorb` — it handles supersession automatically.
 
 ### Linking
 
