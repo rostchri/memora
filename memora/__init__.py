@@ -2,7 +2,26 @@
 
 import json
 import os
+from importlib.metadata import version as _meta_version, PackageNotFoundError as _PNF
 from pathlib import Path as _Path
+
+
+def _get_version() -> str:
+    """Read version from package metadata or pyproject.toml fallback."""
+    try:
+        return _meta_version("memora-mcp")
+    except _PNF:
+        pass
+    toml = _Path(__file__).resolve().parent.parent / "pyproject.toml"
+    if toml.exists():
+        import re
+        m = re.search(r'^version\s*=\s*"([^"]+)"', toml.read_text(), re.M)
+        if m:
+            return m.group(1)
+    return "unknown"
+
+
+__version__ = _get_version()
 
 DEFAULT_TAGS = {
     "general",
@@ -65,4 +84,4 @@ def list_allowed_tags() -> list[str]:
     return sorted(TAG_WHITELIST)
 
 
-__all__ = ["server", "storage", "TAG_WHITELIST", "list_allowed_tags"]
+__all__ = ["__version__", "server", "storage", "TAG_WHITELIST", "list_allowed_tags"]

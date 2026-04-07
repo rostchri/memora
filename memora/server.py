@@ -2043,7 +2043,10 @@ async def memory_events_clear(event_ids: List[int]) -> Dict[str, Any]:
 
 
 def main(argv: Optional[list[str]] = None) -> None:
+    from . import __version__
+
     parser = argparse.ArgumentParser(description="Memory MCP Server")
+    parser.add_argument("--version", action="version", version=f"memora {__version__}")
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # Default: start server (make it the default if no subcommand)
