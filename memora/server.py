@@ -87,6 +87,7 @@ _TOOL_COOLDOWNS: Dict[str, int] = {
     "memory_rebuild_embeddings": 300,
     "memory_rebuild_crossrefs": 300,
     "memory_find_duplicates": 120,
+    "memory_detect_supersessions": 30,
     "memory_migrate_images": 300,
     "memory_insights": 120,
     "memory_export": 60,
@@ -290,6 +291,26 @@ def _absorb_memory(
         metadata=metadata,
         tags=tags,
         dry_run=dry_run,
+    )
+
+
+@_with_connection(writes=True)
+def _detect_supersessions(
+    conn,
+    min_similarity: float,
+    limit: int,
+    dry_run: bool,
+    tags_any: Optional[List[str]],
+    min_confidence: float,
+):
+    from .storage import detect_supersessions
+    return detect_supersessions(
+        conn,
+        min_similarity=min_similarity,
+        limit=limit,
+        dry_run=dry_run,
+        tags_any=tags_any,
+        min_confidence=min_confidence,
     )
 
 
@@ -1620,6 +1641,54 @@ async def _find_duplicates_impl(
         "analyzed": len(pairs),
         "llm_available": llm_available,
     }
+
+
+@mcp.tool()
+async def memory_detect_supersessions(
+    min_similarity: float = 0.55,
+    limit: int = 20,
+    dry_run: bool = True,
+    tags_any: Optional[List[str]] = None,
+    min_confidence: float = 0.75,
+) -> Dict[str, Any]:
+    """Detect memories that supersede (update/replace) other memories.
+
+    Scans existing memories for pairs where one is an evolved/updated version
+    of another, then creates 'supersedes' edges between them. Complements
+    memory_absorb which only catches supersessions at write time.
+
+    Uses neutral LLM classification (not biased by timestamps) to determine
+    both the relationship type and direction.
+
+    Args:
+        min_similarity: Minimum embedding similarity to consider (default: 0.55)
+        limit: Maximum pairs to analyze with LLM (default: 20)
+        dry_run: If True, preview detections without creating edges (default: True)
+        tags_any: Only consider memories with any of these tags
+        min_confidence: Minimum LLM confidence to accept (default: 0.75)
+
+    Returns:
+        Dictionary with candidates found, analyzed count, detected supersessions,
+        and detailed results for each pair.
+
+    Rate limited: 120s cooldown.
+    """
+    if msg := _check_tool_cooldown("memory_detect_supersessions"):
+        return {"error": "rate_limited", "message": msg}
+    try:
+        result = _detect_supersessions(
+            min_similarity, limit, dry_run, tags_any, min_confidence,
+        )
+    except Exception as exc:
+        logger.error("memory_detect_supersessions failed: %s", exc, exc_info=True)
+        return _safe_error(exc, "memory_detect_supersessions")
+    finally:
+        _finish_tool("memory_detect_supersessions")
+
+    if not dry_run and result.get("supersessions_created", 0) > 0:
+        _schedule_cloud_graph_sync()
+
+    return result
 
 
 @mcp.tool()
