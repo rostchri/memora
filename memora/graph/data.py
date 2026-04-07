@@ -351,7 +351,7 @@ CLUSTER_COLORS = [
 
 
 def _build_cluster_data(
-    conn, memories: List[Dict], min_score: float = 0.5
+    conn, memories: List[Dict], min_score: float = 0.40
 ) -> Dict[str, Any]:
     """Build cluster mappings using Louvain community detection.
 
