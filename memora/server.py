@@ -979,15 +979,15 @@ async def memory_absorb(
     tags: Optional[list[str]] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Intelligently absorb facts into memory with automatic deduplication.
+    """Intelligently absorb facts into memory with dedup and consolidation.
 
     For each fact: searches for similar existing memories, classifies the
     relationship via LLM (duplicate/update/contradict/related/new), then
-    takes the appropriate action. Use this instead of memory_create when
-    saving knowledge that may overlap with existing memories.
+    takes the appropriate action. Related new facts are automatically
+    consolidated into single, richer memories via LLM synthesis.
 
     Args:
-        facts: List of atomic fact strings to absorb (one topic per fact)
+        facts: List of fact strings to absorb (can be granular — related ones get merged)
         source: Origin of facts — "manual", "session_end", "post_tool", "import"
         confidence: Caller's certainty about these facts (0.0-1.0, default: 0.8)
         context: Optional surrounding context to help disambiguate facts
