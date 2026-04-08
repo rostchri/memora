@@ -817,8 +817,25 @@ def _validate_tags(tags: Optional[Iterable[str]]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 _PROJECT_INDICATORS: Dict[str, List[str]] = {
-    "memora": [r"\bmemora\b", r"\bmemory.server\b", r"\bmcp.server\b", r"\bstorage\.py\b", r"\babsorb\b"],
-    "clmux": [r"\bclmux\b", r"\btmux.workspace\b", r"\bmultiplexer\b"],
+    "memora": [
+        r"\bmemora\b", r"\bmemory.server\b", r"\bmcp.server\b",
+        r"\bstorage\.py\b", r"\babsorb\b", r"\bembedding", r"\bcrossref",
+        r"\bgraph.visualization\b", r"\bknowledge.graph\b",
+        r"\bmemory_create\b", r"\bmemory_absorb\b", r"\bmemory_search\b",
+    ],
+    "clmux": [
+        r"\bclmux\b", r"\btmux.workspace\b", r"\bmultiplexer\b",
+        r"\btmux\b", r"\bpane\b", r"\bworkspace\b", r"\bsidebar\b",
+        r"\btui\b", r"\bdaemon\b", r"\bsocket.server\b",
+    ],
+}
+
+# Tags that imply a project (checked when content detection fails)
+_TAG_PROJECT_MAP: Dict[str, str] = {
+    "clmux": "clmux",
+    "tui": "clmux",
+    "tmux": "clmux",
+    "memora": "memora",
 }
 
 _GENERIC_TAGS_TO_PREFIX = {
@@ -830,21 +847,38 @@ _GENERIC_TAGS_TO_PREFIX = {
 _KNOWN_PROJECT_PREFIXES = tuple(f"{p}/" for p in _PROJECT_INDICATORS)
 
 
-def _detect_project(content: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+def _detect_project(
+    content: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    tags: Optional[List[str]] = None,
+) -> Optional[str]:
     """Detect which project content belongs to. Returns None if ambiguous or unknown."""
     text = content.lower()
     if metadata:
         section = str(metadata.get("section", "")).lower()
         text = f"{text} {section}"
 
-    matched = [
-        project
-        for project, patterns in _PROJECT_INDICATORS.items()
-        if any(re.search(p, text) for p in patterns)
-    ]
+    matched = set()
+    for project, patterns in _PROJECT_INDICATORS.items():
+        if any(re.search(p, text) for p in patterns):
+            matched.add(project)
+
+    # If content is ambiguous or unknown, check tags for project hints
+    if len(matched) != 1 and tags:
+        tag_projects = set()
+        for tag in tags:
+            # Check direct tag match
+            if tag in _TAG_PROJECT_MAP:
+                tag_projects.add(_TAG_PROJECT_MAP[tag])
+            # Check tag prefix (e.g., "memora/todos" → memora)
+            prefix = tag.split("/")[0] if "/" in tag else None
+            if prefix and prefix in _PROJECT_INDICATORS:
+                tag_projects.add(prefix)
+        if len(tag_projects) == 1:
+            return tag_projects.pop()
 
     if len(matched) == 1:
-        return matched[0]
+        return matched.pop()
     return None  # ambiguous (multiple) or unknown (none)
 
 
@@ -861,7 +895,7 @@ def _normalize_tags(
     if not tags:
         return tags
 
-    project = _detect_project(content, metadata)
+    project = _detect_project(content, metadata, tags)
     if not project:
         return tags
 
@@ -895,9 +929,10 @@ def _filter_suggested_tags(suggested: List[str]) -> List[str]:
 def _auto_assign_section(
     metadata: Optional[Dict[str, Any]],
     content: str,
+    tags: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Auto-assign metadata.section based on detected project if not already set."""
-    project = _detect_project(content, metadata)
+    project = _detect_project(content, metadata, tags)
     if not project:
         return metadata
 
@@ -2560,7 +2595,7 @@ def add_memory(
 
     # Auto-detect memory type (issue/todo) from content if not explicitly set
     metadata, tags = _apply_auto_detection(content, metadata, tags)
-    metadata = _auto_assign_section(metadata, content)
+    metadata = _auto_assign_section(metadata, content, tags)
 
     validated_tags = _validate_tags(tags)
     validated_tags = _normalize_tags(validated_tags, content, metadata)
@@ -2653,7 +2688,7 @@ def add_memories(
         tags = entry.get("tags") or []
         # Auto-detect memory type (issue/todo) from content if not explicitly set
         metadata, tags = _apply_auto_detection(content, metadata, tags)
-        metadata = _auto_assign_section(metadata, content)
+        metadata = _auto_assign_section(metadata, content, tags)
         prepared_metadata = _prepare_metadata(metadata)
         validated_tags = _validate_tags(tags)
         validated_tags = _normalize_tags(validated_tags, content, metadata)
@@ -3229,7 +3264,7 @@ def backfill_tags(
         new_tags = _normalize_tags(old_tags, content, metadata)
 
         # Auto-assign section if missing
-        new_metadata = _auto_assign_section(metadata, content)
+        new_metadata = _auto_assign_section(metadata, content, old_tags)
         section_changed = (new_metadata or {}).get("section") != (metadata or {}).get("section")
 
         if sorted(new_tags) != sorted(old_tags) or section_changed:
@@ -4459,7 +4494,7 @@ def import_memories(
             created_at = entry.get("created_at")
 
             # Prepare data
-            metadata = _auto_assign_section(metadata, content)
+            metadata = _auto_assign_section(metadata, content, tags)
             prepared_metadata = _prepare_metadata(metadata) if metadata else None
             validated_tags = _validate_tags(tags)
             validated_tags = _normalize_tags(validated_tags, content, metadata)
