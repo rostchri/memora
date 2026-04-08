@@ -851,12 +851,16 @@ def _detect_project(
     content: str,
     metadata: Optional[Dict[str, Any]] = None,
     tags: Optional[List[str]] = None,
+    context: Optional[str] = None,
 ) -> Optional[str]:
     """Detect which project content belongs to. Returns None if ambiguous or unknown."""
     text = content.lower()
     if metadata:
         section = str(metadata.get("section", "")).lower()
-        text = f"{text} {section}"
+        meta_context = str(metadata.get("context", "")).lower()
+        text = f"{text} {section} {meta_context}"
+    if context:
+        text = f"{text} {context.lower()}"
 
     matched = set()
     for project, patterns in _PROJECT_INDICATORS.items():
@@ -3161,6 +3165,8 @@ def absorb_memory(
     merged_meta = dict(metadata or {})
     merged_meta["source"] = source
     merged_meta["confidence"] = confidence
+    if context:
+        merged_meta["context"] = context
 
     # Helper: merge suggested tags into caller-provided tags
     def _merge_tags(base_tags: Optional[List[str]], extra: List[str]) -> Optional[List[str]]:
