@@ -88,7 +88,7 @@ _TOOL_COOLDOWNS: Dict[str, int] = {
     "memory_rebuild_crossrefs": 300,
     "memory_find_duplicates": 120,
     "memory_detect_supersessions": 30,
-    "memory_backfill_tags": 120,
+    "memory_backfill_tags": 10,
     "memory_migrate_images": 300,
     "memory_insights": 120,
     "memory_export": 60,
