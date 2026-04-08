@@ -19,7 +19,7 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, conversa
 </p>
 
 <p align="center">
-<b><a href="#features">Features</a></b> · <b><a href="#install">Install</a></b> · <b><a href="#usage">Usage</a></b> · <b><a href="#configuration">Config</a></b> · <b><a href="#live-graph-server">Live Graph</a></b> · <b><a href="#cloud-graph">Cloud Graph</a></b> · <b><a href="#chat-with-memories">Chat</a></b> · <b><a href="#semantic-search--embeddings">Semantic Search</a></b> · <b><a href="#llm-deduplication">LLM Dedup</a></b> · <b><a href="#memory-linking">Linking</a></b> · <b><a href="#neovim-integration">Neovim</a></b>
+<b><a href="#features">Features</a></b> · <b><a href="#install">Install</a></b> · <b><a href="#usage">Usage</a></b> · <b><a href="#configuration">Config</a></b> · <b><a href="#live-graph-server">Live Graph</a></b> · <b><a href="#cloud-graph">Cloud Graph</a></b> · <b><a href="#chat-with-memories">Chat</a></b> · <b><a href="#semantic-search--embeddings">Semantic Search</a></b> · <b><a href="#document-storage">Documents</a></b> · <b><a href="#llm-deduplication">LLM Dedup</a></b> · <b><a href="#memory-linking">Linking</a></b> · <b><a href="#neovim-integration">Neovim</a></b>
 </p>
 
 ## Features
@@ -35,6 +35,11 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, conversa
 - 🔀 **Cross-references** - Auto-linked related memories based on similarity
 - 🤖 **LLM Deduplication** - Find and merge duplicates with AI-powered comparison
 - 🔗 **Memory Linking** - Typed edges, importance boosting, and cluster detection
+
+**Document Storage**
+- 📄 **Structured Documents** - Store markdown documents as searchable fragment trees (claims, plan items, references, risks)
+- 🔒 **Fragment Integrity** - Guards against accidental delete/merge/absorb of document fragments
+- 🔍 **Granular Search** - Individual claims and findings are semantically searchable while the full document remains retrievable as a unit
 
 **Tools & Visualization**
 - ⚡ **Memory Automation** - Structured tools for TODOs, issues, and sections
@@ -364,6 +369,41 @@ memory_merge(source_id=123, target_id=456, merge_strategy="append")
 - `suggested_action`: "merge", "keep_both", or "review"
 
 Works with any OpenAI-compatible API (OpenAI, OpenRouter, Azure, etc.) via `OPENAI_BASE_URL`.
+
+</details>
+
+<details id="document-storage">
+<summary><big><big><strong>Document Storage</strong></big></big></summary>
+
+Store structured documents (research reports, architecture decisions, post-mortems) as searchable fragment trees:
+
+```python
+# Store a markdown document — auto-parsed into typed fragments
+memory_store_document(
+    content="# Research Report\n\n## Evidence Table\n| Claim | Confidence |\n...",
+    document_key="research/memora-enhancements-2026-04-08",
+    tags=["memora/research"]
+)
+# Returns: {root_id: 230, fragment_count: 100, node_map: {claim: [...], plan_item: [...], ...}}
+
+# Retrieve the full document or specific fragment types
+memory_get_document(document_key="research/memora-enhancements-2026-04-08")
+memory_get_document(document_key="...", node_kinds=["claim"], content_mode="full")
+
+# Delete a document and all its fragments
+memory_delete_document(document_key="research/memora-enhancements-2026-04-08")
+```
+
+**How it works:** The parser splits markdown by structure — tables become individual claims, numbered lists become plan items, URL lists become references, and risk sections become risk fragments. Each fragment is independently searchable via `memory_semantic_search` while the full document is retrievable as a unit.
+
+**Fragment types:** `claim`, `plan_item`, `reference`, `section_chunk`, `risk`
+
+**Integrity guards:** Document fragments are protected from accidental modification:
+- `memory_delete` requires `force=True` for fragments
+- `memory_merge` refuses to merge fragments
+- `memory_absorb` excludes fragments from similarity matching
+- `memory_find_duplicates` and `memory_detect_supersessions` skip fragments
+- Graph UI hides fragments, shows only the document root node
 
 </details>
 
