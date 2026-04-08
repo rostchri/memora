@@ -931,16 +931,36 @@ def _auto_assign_section(
     content: str,
     tags: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Auto-assign metadata.section based on detected project if not already set."""
+    """Auto-assign metadata.section and subsection based on detected project and tags."""
     project = _detect_project(content, metadata, tags)
     if not project:
         return metadata
 
-    if metadata and metadata.get("section"):
-        return metadata  # already has a section
+    has_section = metadata and metadata.get("section")
+    has_subsection = metadata and metadata.get("subsection")
+
+    if has_section and has_subsection:
+        return metadata  # fully assigned
 
     updated = dict(metadata) if metadata else {}
-    updated["section"] = project
+
+    if not has_section:
+        updated["section"] = project
+
+    # Derive subsection from the most specific project-prefixed tag
+    if not has_subsection and tags:
+        prefix = f"{project}/"
+        subsections = [
+            tag[len(prefix):] for tag in tags
+            if tag.startswith(prefix) and tag != project
+        ]
+        if subsections:
+            # Pick the most descriptive one (prefer non-type tags over issues/todos/sections)
+            type_tags = {"issues", "todos", "sections"}
+            content_subs = [s for s in subsections if s not in type_tags]
+            best = content_subs[0] if content_subs else subsections[0]
+            updated["subsection"] = best
+
     return updated
 
 
