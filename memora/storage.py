@@ -958,6 +958,17 @@ def _auto_assign_section(
             tag[len(prefix):] for tag in tags
             if tag.startswith(prefix) and tag != project
         ]
+
+        # Fallback: check bare tags as subsection candidates
+        if not subsections:
+            # Known topic tags that map to subsections
+            _SUBSECTION_TAGS = {
+                "tui", "architecture", "research", "roadmap", "bugfix",
+                "design-decisions", "skills", "knowledge", "changelog",
+                "overview", "risks",
+            }
+            subsections = [t for t in tags if t in _SUBSECTION_TAGS]
+
         if subsections:
             # Pick the most descriptive one (prefer non-type tags over issues/todos/sections)
             type_tags = {"issues", "todos", "sections"}
