@@ -874,10 +874,16 @@ def _detect_project(
             # Check direct tag match
             if tag in _TAG_PROJECT_MAP:
                 tag_projects.add(_TAG_PROJECT_MAP[tag])
-            # Check tag prefix (e.g., "memora/todos" → memora)
-            prefix = tag.split("/")[0] if "/" in tag else None
-            if prefix and prefix in _PROJECT_INDICATORS:
-                tag_projects.add(prefix)
+            # Check slash-prefixed tag (e.g., "memora/todos" → memora)
+            if "/" in tag:
+                prefix = tag.split("/", 1)[0]
+                if prefix in _PROJECT_INDICATORS:
+                    tag_projects.add(prefix)
+            # Check hyphen-prefixed tag (e.g., "clmux-architecture" → clmux)
+            if "-" in tag:
+                hyphen_prefix = tag.split("-", 1)[0]
+                if hyphen_prefix in _PROJECT_INDICATORS:
+                    tag_projects.add(hyphen_prefix)
         if len(tag_projects) == 1:
             return tag_projects.pop()
 
