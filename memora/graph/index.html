@@ -104,8 +104,31 @@ div.vis-tooltip {
 #panel-tabs .tab { padding: 8px 20px; cursor: pointer; color: #8b949e; border-radius: 6px; font-size: 13px; font-weight: 500; transition: all 0.15s ease; }
 #panel-tabs .tab.active { color: #fff; background: linear-gradient(135deg, #238636 0%, #2ea043 100%); box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
 #panel-tabs .tab:not(.active):hover { color: #c9d1d9; background: #21262d; }
-#tab-detail, #tab-timeline, #tab-history { display: none; }
-#tab-detail.active, #tab-timeline.active, #tab-history.active { display: block; }
+#tab-detail, #tab-timeline, #tab-duplicates, #tab-history { display: none; }
+#tab-detail.active, #tab-timeline.active, #tab-duplicates.active, #tab-history.active { display: block; }
+#tab-duplicates { padding: 0; }
+#duplicates-toolbar { padding: 12px 16px; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+#duplicates-summary { color: #8b949e; font-size: 12px; }
+.tab-badge { background: #f85149; color: #fff; border-radius: 10px; padding: 1px 7px; font-size: 10px; font-weight: 600; margin-left: 4px; vertical-align: middle; }
+#duplicates-list { max-height: calc(100vh - 160px); overflow-y: auto; }
+.dup-pair { padding: 12px 16px; border-bottom: 1px solid #30363d; }
+.dup-pair-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; }
+.dup-pair-ids { color: #58a6ff; font-weight: 500; font-family: monospace; }
+.dup-pair-score { padding: 1px 7px; border-radius: 10px; font-weight: 600; font-size: 10px; }
+.dup-pair-score.high { background: #f8514922; color: #ff7b72; border: 1px solid #f85149; }
+.dup-pair-score.candidate { background: #d2932022; color: #d29320; border: 1px solid #d29320; }
+.dup-pair-meta { color: #8b949e; font-size: 11px; flex: 1; text-align: right; }
+.dup-pair-bodies { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+.dup-pair-body { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 8px; font-size: 11px; line-height: 1.4; color: #c9d1d9; max-height: 90px; overflow: hidden; }
+.dup-pair-body-header { color: #58a6ff; font-family: monospace; font-size: 10px; margin-bottom: 4px; }
+.dup-pair-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.dup-action-btn { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+.dup-action-btn:hover { background: #30363d; }
+.dup-action-btn.danger { color: #ff7b72; }
+.dup-action-btn.primary { background: #238636; border-color: #238636; color: #fff; }
+.dup-action-btn.primary:hover { background: #2ea043; }
+.dup-empty { padding: 30px 20px; text-align: center; color: #8b949e; font-size: 13px; }
+.dup-loading { padding: 30px 20px; text-align: center; color: #8b949e; font-size: 13px; }
 #timeline-list { max-height: calc(100vh - 120px); overflow-y: auto; }
 #timeline-list .memory-item { padding: 10px; border-bottom: 1px solid #30363d; cursor: pointer; display: flex; flex-direction: column; }
 #timeline-list .memory-item:hover { background: #21262d; }
@@ -478,6 +501,7 @@ div.vis-tooltip {
         <div id="panel-tabs">
             <span class="tab active" onclick="switchTab('detail')">Details</span>
             <span class="tab" onclick="switchTab('timeline')">Timeline</span>
+            <span class="tab" onclick="switchTab('duplicates')">Duplicates <span id="duplicates-badge" class="tab-badge" style="display:none;"></span></span>
             <span class="tab" onclick="switchTab('history')">History</span>
         </div>
         <div id="tab-detail" class="active">
@@ -508,6 +532,13 @@ div.vis-tooltip {
         <div id="tab-timeline">
             <div id="timeline-filter"><button class="filter-btn" onclick="filterTimeline('favorites')">&#9733; Favorites</button><button class="filter-btn active" onclick="filterTimeline('all')">Show All</button></div>
             <div id="timeline-list"></div>
+        </div>
+        <div id="tab-duplicates">
+            <div id="duplicates-toolbar">
+                <button class="filter-btn" id="duplicates-rescan-btn" onclick="loadDuplicates(true)">&#8635; Rescan</button>
+                <span id="duplicates-summary"></span>
+            </div>
+            <div id="duplicates-list"></div>
         </div>
         <div id="tab-history">
             <div id="history-list"></div>
@@ -1337,9 +1368,12 @@ div.vis-tooltip {
             document.querySelector('#panel-tabs .tab[onclick*="' + tabName + '"]').classList.add('active');
             document.getElementById('tab-detail').classList.toggle('active', tabName === 'detail');
             document.getElementById('tab-timeline').classList.toggle('active', tabName === 'timeline');
+            document.getElementById('tab-duplicates').classList.toggle('active', tabName === 'duplicates');
             document.getElementById('tab-history').classList.toggle('active', tabName === 'history');
             if (tabName === 'timeline') {
                 populateTimelineList();
+            } else if (tabName === 'duplicates') {
+                loadDuplicates(false);
             } else if (tabName === 'history') {
                 populateHistoryList();
             } else if (tabName === 'detail' && currentPanelMemoryId) {
@@ -1349,6 +1383,122 @@ div.vis-tooltip {
                     loadMemoryToPanel(currentPanelMemoryId);
                 }
             }
+        }
+
+        // --- Duplicates tab ---
+        var duplicatesData = null;
+        var duplicatesLoading = false;
+
+        function loadDuplicates(forceReload) {
+            if (duplicatesLoading) return;
+            if (!forceReload && duplicatesData) {
+                renderDuplicatesList(duplicatesData);
+                return;
+            }
+            duplicatesLoading = true;
+            var listEl = document.getElementById('duplicates-list');
+            var sumEl = document.getElementById('duplicates-summary');
+            listEl.innerHTML = '<div class="dup-loading">Loading duplicate candidates&hellip;</div>';
+            sumEl.textContent = '';
+            var dbp = getDbParam();
+            var sep = dbp ? dbp + '&' : '?';
+            fetch('/api/duplicates' + sep + 'limit=100')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    duplicatesLoading = false;
+                    duplicatesData = data;
+                    renderDuplicatesList(data);
+                    updateDuplicatesBadge(data.total || 0);
+                })
+                .catch(function() {
+                    duplicatesLoading = false;
+                    listEl.innerHTML = '<div class="dup-empty" style="color:#f85149;">Failed to load duplicates.</div>';
+                });
+        }
+
+        function updateDuplicatesBadge(count) {
+            var badge = document.getElementById('duplicates-badge');
+            if (!badge) return;
+            if (count > 0) {
+                badge.textContent = count;
+                badge.style.display = '';
+            } else {
+                badge.style.display = 'none';
+            }
+        }
+
+        function renderDuplicatesList(data) {
+            var listEl = document.getElementById('duplicates-list');
+            var sumEl = document.getElementById('duplicates-summary');
+            var pairs = (data && data.pairs) || [];
+            var total = (data && data.total) || 0;
+            if (pairs.length === 0) {
+                listEl.innerHTML = '<div class="dup-empty">No duplicate candidates above threshold ' + (data && data.min_similarity || 0.85) + '.</div>';
+                sumEl.textContent = '';
+                return;
+            }
+            var highCount = pairs.filter(function(p) { return p.tier === 'high'; }).length;
+            sumEl.textContent = total + ' pair' + (total === 1 ? '' : 's') + ' (' + highCount + ' high-confidence)';
+            var html = '';
+            for (var i = 0; i < pairs.length; i++) {
+                var p = pairs[i];
+                html += renderDupPair(p);
+            }
+            listEl.innerHTML = html;
+        }
+
+        function escapeHtml(s) {
+            if (s == null) return '';
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function formatDate(iso) {
+            if (!iso) return '';
+            try {
+                var d = new Date(iso);
+                if (isNaN(d.getTime())) return iso;
+                return d.toISOString().slice(0, 10);
+            } catch (e) { return iso; }
+        }
+
+        function renderDupPair(p) {
+            var scoreStr = p.score.toFixed(2);
+            var tierLabel = p.tier === 'high' ? 'high-confidence' : 'candidate';
+            var dateA = formatDate(p.a.created_at);
+            var dateB = formatDate(p.b.created_at);
+            var sharedTags = (p.a.tags || []).filter(function(t) { return (p.b.tags || []).indexOf(t) !== -1; });
+            var sharedStr = sharedTags.length > 0 ? 'shared: ' + sharedTags.slice(0, 3).map(escapeHtml).join(', ') : '';
+            return ''
+                + '<div class="dup-pair">'
+                + '  <div class="dup-pair-header">'
+                + '    <span class="dup-pair-ids">#' + p.a.id + ' &harr; #' + p.b.id + '</span>'
+                + '    <span class="dup-pair-score ' + p.tier + '">' + scoreStr + ' ' + tierLabel + '</span>'
+                + '    <span class="dup-pair-meta">' + dateA + ' / ' + dateB + ' &middot; ' + sharedStr + '</span>'
+                + '  </div>'
+                + '  <div class="dup-pair-bodies">'
+                + '    <div class="dup-pair-body" onclick="loadMemoryToPanel(' + p.a.id + ');switchTab(\'detail\');">'
+                + '      <div class="dup-pair-body-header">#' + p.a.id + '</div>'
+                + escapeHtml(p.a.preview)
+                + '    </div>'
+                + '    <div class="dup-pair-body" onclick="loadMemoryToPanel(' + p.b.id + ');switchTab(\'detail\');">'
+                + '      <div class="dup-pair-body-header">#' + p.b.id + '</div>'
+                + escapeHtml(p.b.preview)
+                + '    </div>'
+                + '  </div>'
+                + '  <div class="dup-pair-actions">'
+                + '    <button class="dup-action-btn" onclick="loadMemoryToPanel(' + p.a.id + ');switchTab(\'detail\');">View #' + p.a.id + '</button>'
+                + '    <button class="dup-action-btn" onclick="loadMemoryToPanel(' + p.b.id + ');switchTab(\'detail\');">View #' + p.b.id + '</button>'
+                + '    <button class="dup-action-btn primary" disabled title="Not implemented yet">Merge into newer</button>'
+                + '    <button class="dup-action-btn" disabled title="Not implemented yet">Mark supersedes</button>'
+                + '    <button class="dup-action-btn" disabled title="Not implemented yet">Keep both</button>'
+                + '    <button class="dup-action-btn danger" disabled title="Not implemented yet">Dismiss</button>'
+                + '  </div>'
+                + '</div>';
         }
 
         function loadMemoryToPanel(memId) {
@@ -1421,7 +1571,11 @@ div.vis-tooltip {
 
         function renderTimelineList(memories) {
             memories = memories.filter(function(mem) {
-                return !(mem.metadata && mem.metadata.type === 'section');
+                if (!mem.metadata) return true;
+                // Hide section placeholders and document fragments — only the
+                // document_root represents the doc as a whole and stays visible.
+                var t = mem.metadata.type;
+                return t !== 'section' && t !== 'document_fragment';
             });
             cachedTimelineMemories = memories;
             if (timelineFilter === 'favorites') {
@@ -2101,6 +2255,16 @@ div.vis-tooltip {
                 duplicatesHtml = '<div id="duplicates-legend"><div class="legend-item" onclick="filterByDuplicates()"><span class="legend-color" style="background:#a855f7;border:2px solid #f85149;"></span>Duplicates (' + graphData.duplicateIds.length + ')</div></div>';
             }
             document.getElementById('duplicates-legend-items').innerHTML = duplicatesHtml;
+
+            // Lightweight badge fetch — get pair count without loading the full list
+            (function() {
+                var dbp = getDbParam();
+                var sep = dbp ? dbp + '&' : '?';
+                fetch('/api/duplicates' + sep + 'limit=1')
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) { updateDuplicatesBadge((data && data.total) || 0); })
+                    .catch(function() {});
+            })();
 
             function toggleTags() {
                 var items = document.getElementById('legend-items');
