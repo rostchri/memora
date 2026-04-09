@@ -6,6 +6,32 @@ from importlib.metadata import version as _meta_version, PackageNotFoundError as
 from pathlib import Path as _Path
 
 
+def _bootstrap_mcp_env() -> None:
+    """Walk up from cwd to find .mcp.json and set memora env vars (if not already set).
+
+    Allows the clmux daemon (and any non-MCP caller) to spawn `python3 -m memora.cli`
+    without inheriting the MCP env from its launch context. Runs at package import
+    time so MEMORA_STORAGE_URI / MEMORA_ALLOW_ANY_TAG / etc. are visible to the
+    module-level TAG_WHITELIST computation below.
+    """
+    cwd = _Path.cwd()
+    for parent in [cwd, *cwd.parents]:
+        mcp_path = parent / ".mcp.json"
+        if not mcp_path.is_file():
+            continue
+        try:
+            data = json.loads(mcp_path.read_text())
+        except Exception:
+            return
+        env = data.get("mcpServers", {}).get("memora", {}).get("env", {})
+        for key, value in env.items():
+            os.environ.setdefault(key, str(value))
+        return
+
+
+_bootstrap_mcp_env()
+
+
 def _get_version() -> str:
     """Read version from package metadata or pyproject.toml fallback."""
     try:

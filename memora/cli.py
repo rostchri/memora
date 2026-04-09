@@ -3,36 +3,17 @@
 Usage:
     python3 -m memora.cli search "query" [--top-k 7] [--tags tag1,tag2]
     python3 -m memora.cli health
+    echo "fact" | python3 -m memora.cli absorb [--source S] [--context C] [--tags t1,t2]
 
-Env loading: walks up from cwd to find .mcp.json and loads the `memora`
-server's env (MEMORA_STORAGE_URI, CLOUDFLARE_API_TOKEN, etc) before
-importing memora modules. This lets the clmux daemon spawn us without
-inheriting MCP env vars from its launch context.
+Env loading: handled by `memora/__init__.py` _bootstrap_mcp_env() which
+walks up from cwd to find .mcp.json and exports the memora server env
+(MEMORA_STORAGE_URI, MEMORA_ALLOW_ANY_TAG, CLOUDFLARE_API_TOKEN, etc.)
+before TAG_WHITELIST and other module-level state are computed.
 """
 from __future__ import annotations
 
 import json
-import os
 import sys
-from pathlib import Path
-
-
-def _load_mcp_env() -> None:
-    """Find nearest .mcp.json walking up from cwd and load memora env vars."""
-    cwd = Path.cwd()
-    for parent in [cwd, *cwd.parents]:
-        mcp_path = parent / ".mcp.json"
-        if not mcp_path.is_file():
-            continue
-        try:
-            data = json.loads(mcp_path.read_text())
-        except Exception:
-            return
-        env = data.get("mcpServers", {}).get("memora", {}).get("env", {})
-        for key, value in env.items():
-            # Don't clobber existing env vars
-            os.environ.setdefault(key, str(value))
-        return
 
 
 def cmd_health() -> None:
@@ -77,12 +58,33 @@ def cmd_search(query: str, top_k: int = 7, tags_any: list[str] | None = None) ->
     json.dump({"count": len(results), "results": results}, sys.stdout)
 
 
-def main() -> None:
-    _load_mcp_env()
+def cmd_absorb(
+    fact: str,
+    source: str = "manual",
+    context: str | None = None,
+    tags: list[str] | None = None,
+) -> None:
+    from .storage import absorb_memory, connect
 
+    conn = connect()
+    try:
+        result = absorb_memory(
+            conn,
+            [fact],
+            source=source,
+            context=context,
+            tags=tags or None,
+        )
+    finally:
+        conn.close()
+
+    json.dump(result, sys.stdout, default=str)
+
+
+def main() -> None:
     args = sys.argv[1:]
     if not args:
-        print("usage: python3 -m memora.cli {health|search} ...", file=sys.stderr)
+        print("usage: python3 -m memora.cli {health|search|absorb} ...", file=sys.stderr)
         sys.exit(1)
 
     cmd = args[0]
@@ -106,6 +108,29 @@ def main() -> None:
             else:
                 i += 1
         cmd_search(query, top_k=top_k, tags_any=tags_any)
+    elif cmd == "absorb":
+        # Read fact from stdin (avoids argv length limits for large facts)
+        fact = sys.stdin.read().strip()
+        if not fact:
+            print("error: absorb expects a non-empty fact on stdin", file=sys.stderr)
+            sys.exit(1)
+        source = "manual"
+        context: str | None = None
+        tags: list[str] | None = None
+        i = 1
+        while i < len(args):
+            if args[i] == "--source" and i + 1 < len(args):
+                source = args[i + 1]
+                i += 2
+            elif args[i] == "--context" and i + 1 < len(args):
+                context = args[i + 1]
+                i += 2
+            elif args[i] == "--tags" and i + 1 < len(args):
+                tags = [t for t in args[i + 1].split(",") if t]
+                i += 2
+            else:
+                i += 1
+        cmd_absorb(fact, source=source, context=context, tags=tags)
     else:
         print(f"unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)
