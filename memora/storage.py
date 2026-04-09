@@ -29,6 +29,9 @@ from .embeddings import (
     cosine_similarity as _cosine_similarity,
 )
 from .embeddings import (
+    embedding_norm as _embedding_norm,
+)
+from .embeddings import (
     compute_embeddings_batch as _compute_embeddings_batch,
 )
 from .embeddings import (
@@ -1454,8 +1457,19 @@ def find_duplicate_candidates(
             if related_id is None:
                 continue
 
-            # Skip typed link entries (supersedes, extends, etc.) — only score-based crossrefs
-            if rel.get("edge_type"):
+            # Skip typed link entries (supersedes, extends, references, etc.).
+            # `related_to` is overloaded: compute_crossrefs writes it as a
+            # default tag alongside real cosine scores, but absorb's
+            # link_memories ALSO writes it with hardcoded score=1.0 for
+            # "linked-but-not-duplicate" facts. Both routes can't be told
+            # apart by edge_type alone — distinguish by score: cosine of
+            # non-identical TF-IDF/embedding vectors is mathematically
+            # always < 1.0, so score >= 0.9999 means it's an absorb link,
+            # not a real duplicate candidate. Skip it.
+            edge_type = rel.get("edge_type")
+            if edge_type and edge_type != "related_to":
+                continue
+            if score >= 0.9999:
                 continue
 
             # Ensure both IDs are ints for consistent comparison
@@ -1939,6 +1953,33 @@ def _store_crossrefs(
         """,
         (memory_id, related_json),
     )
+
+
+def _store_crossrefs_bulk(
+    conn: sqlite3.Connection,
+    rows: List[Tuple[int, List[Dict[str, Any]]]],
+    chunk_size: int = 50,
+) -> None:
+    """Bulk-write crossrefs for many memories using chunked multi-row INSERTs.
+
+    Reduces the per-row HTTP round-trip cost on D1 from N writes to N/chunk
+    writes. Each chunk is a single multi-row INSERT ... ON CONFLICT statement.
+    """
+    if not rows:
+        return
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        placeholders = ",".join(["(?, ?)"] * len(chunk))
+        params: List[Any] = []
+        for memory_id, related in chunk:
+            params.append(memory_id)
+            params.append(json.dumps(related, ensure_ascii=False) if related else None)
+        sql = (
+            f"INSERT INTO memories_crossrefs(memory_id, related) "
+            f"VALUES {placeholders} "
+            f"ON CONFLICT(memory_id) DO UPDATE SET related=excluded.related"
+        )
+        conn.execute(sql, tuple(params))
 
 
 def _clear_crossrefs(conn: sqlite3.Connection, memory_id: int) -> None:
@@ -2660,18 +2701,112 @@ def _update_crossrefs(conn: sqlite3.Connection, memory_id: int) -> None:
 
 
 def rebuild_crossrefs(conn: sqlite3.Connection) -> int:
-    rows = conn.execute("SELECT id, metadata FROM memories").fetchall()
-    total = 0
-    for row in rows:
+    """Recompute every memory's score-based crossrefs.
+
+    Optimized path: pull all (id, metadata, embedding) rows ONCE via the
+    paginated JOIN helper, compute the all-pairs cosine matrix in pure
+    Python, then write each memory's top-K crossrefs in a single pass.
+
+    The naive per-memory implementation called _update_crossrefs_for_memory
+    in a loop, which re-paginated the entire embeddings table on every
+    iteration — O(N) D1 round-trips × O(N) row reads = O(N²) bandwidth.
+    This version makes one pass through the table and does the rest in
+    process memory.
+    """
+    # Pull every memory + embedding into local memory in a single pass.
+    entries: List[Dict[str, Any]] = []  # {id, type, vector, content, metadata, tags}
+    for row, vector in _iter_memories_with_embeddings(conn):
         memory_id = row["id"]
-        # Skip section memories - they don't need cross-references
-        metadata = json.loads(row["metadata"]) if row["metadata"] else {}
-        if metadata.get("type") == "section":
+        try:
+            metadata_json = row["metadata"]
+        except (IndexError, KeyError):
+            metadata_json = None
+        metadata = json.loads(metadata_json) if metadata_json else {}
+        meta_type = metadata.get("type") if isinstance(metadata, dict) else None
+
+        # Skip section memories — they don't get crossrefs at all.
+        if meta_type == "section":
             continue
-        _update_crossrefs_for_memory(conn, memory_id)
-        total += 1
+
+        # Lazy-backfill missing embeddings (legacy/imported memories) so the
+        # rebuild also re-embeds anything that's still on TF-IDF or empty.
+        if vector is None:
+            try:
+                tags_json = row["tags"]
+            except (IndexError, KeyError):
+                tags_json = None
+            tags = json.loads(tags_json) if tags_json else []
+            content = row["content"]
+            vector = _compute_embedding(content, metadata, tags)
+            _upsert_embedding(conn, memory_id, vector)
+
+        if not vector:
+            # Genuinely empty (e.g. blank content) — store an empty crossref
+            # so the lookup still finds the row but skip it as a candidate.
+            _store_crossrefs(conn, memory_id, [])
+            continue
+
+        entries.append({
+            "id": memory_id,
+            "type": meta_type,
+            "vector": vector,
+        })
+
+    # Pre-compute norms once per memory.
+    norms: Dict[int, float] = {}
+    for e in entries:
+        n = _embedding_norm(e["vector"])
+        norms[e["id"]] = n if n > 0 else 1.0  # avoid div-by-zero downstream
+
+    # Document fragments/roots are excluded from crossref *results* (per the
+    # original _update_crossrefs_for_memory rule), but they still need their
+    # own crossrefs computed (compatibility with the legacy behavior).
+    is_doc = {e["id"]: (e["type"] in _DOCUMENT_TYPES) for e in entries}
+
+    # All-pairs cosine and top-K selection in pure Python. Inner loop runs
+    # against the local `entries` list — no D1 reads.
+    pending_writes: List[Tuple[int, List[Dict[str, Any]]]] = []
+    for src in entries:
+        src_vec = src["vector"]
+        src_id = src["id"]
+        src_norm = norms[src_id]
+
+        scored: List[Tuple[float, int]] = []
+        for dst in entries:
+            dst_id = dst["id"]
+            if dst_id == src_id:
+                continue
+            if is_doc.get(dst_id):
+                continue  # exclude document fragments/roots from results
+
+            dst_vec = dst["vector"]
+            dst_norm = norms[dst_id]
+
+            # Inline cosine — iterate the smaller dict for the dot product.
+            if len(src_vec) <= len(dst_vec):
+                a, b = src_vec, dst_vec
+            else:
+                a, b = dst_vec, src_vec
+            dot = 0.0
+            for token, weight in a.items():
+                dot += weight * b.get(token, 0.0)
+            score = dot / (src_norm * dst_norm)
+            if score > 0:
+                scored.append((score, dst_id))
+
+        # Top-K (default 5, matching _update_crossrefs_for_memory's top_k=5)
+        scored.sort(reverse=True)
+        related = [
+            {"id": dst_id, "score": score, "edge_type": "related_to"}
+            for score, dst_id in scored[:5]
+        ]
+        pending_writes.append((src_id, related))
+
+    # Bulk write all crossrefs in chunked multi-row INSERTs to amortize the
+    # per-statement HTTP round-trip cost on D1.
+    _store_crossrefs_bulk(conn, pending_writes)
     conn.commit()
-    return total
+    return len(pending_writes)
 
 
 def update_crossrefs(conn: sqlite3.Connection, memory_id: int) -> None:
