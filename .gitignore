@@ -24,6 +24,7 @@ dist/
 
 # Deep-work scratch
 plans/
+.worktrees/
 
 # Research output
 research/
