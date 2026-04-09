@@ -3,11 +3,36 @@
 Usage:
     python3 -m memora.cli search "query" [--top-k 7] [--tags tag1,tag2]
     python3 -m memora.cli health
+
+Env loading: walks up from cwd to find .mcp.json and loads the `memora`
+server's env (MEMORA_STORAGE_URI, CLOUDFLARE_API_TOKEN, etc) before
+importing memora modules. This lets the clmux daemon spawn us without
+inheriting MCP env vars from its launch context.
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
+from pathlib import Path
+
+
+def _load_mcp_env() -> None:
+    """Find nearest .mcp.json walking up from cwd and load memora env vars."""
+    cwd = Path.cwd()
+    for parent in [cwd, *cwd.parents]:
+        mcp_path = parent / ".mcp.json"
+        if not mcp_path.is_file():
+            continue
+        try:
+            data = json.loads(mcp_path.read_text())
+        except Exception:
+            return
+        env = data.get("mcpServers", {}).get("memora", {}).get("env", {})
+        for key, value in env.items():
+            # Don't clobber existing env vars
+            os.environ.setdefault(key, str(value))
+        return
 
 
 def cmd_health() -> None:
@@ -53,6 +78,8 @@ def cmd_search(query: str, top_k: int = 7, tags_any: list[str] | None = None) ->
 
 
 def main() -> None:
+    _load_mcp_env()
+
     args = sys.argv[1:]
     if not args:
         print("usage: python3 -m memora.cli {health|search} ...", file=sys.stderr)
