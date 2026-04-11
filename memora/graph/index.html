@@ -1370,6 +1370,7 @@ div.vis-tooltip {
             document.getElementById('tab-timeline').classList.toggle('active', tabName === 'timeline');
             document.getElementById('tab-duplicates').classList.toggle('active', tabName === 'duplicates');
             document.getElementById('tab-history').classList.toggle('active', tabName === 'history');
+            try { localStorage.setItem('memora-panel-tab', tabName); } catch (e) {}
             if (tabName === 'timeline') {
                 populateTimelineList();
             } else if (tabName === 'duplicates') {
@@ -1619,11 +1620,10 @@ div.vis-tooltip {
             var newState = !isActive;
             el.classList.toggle('active', newState);
             el.textContent = newState ? '\u2605' : '\u2606';
-            var baseMem = memoryCache[memId] || (cachedTimelineMemories || []).find(function(mem) { return mem.id === memId; });
-            var metadata = cloneJson(baseMem && baseMem.metadata ? baseMem.metadata : {});
-            if (newState) metadata.favorite = true;
-            else delete metadata.favorite;
-            patchMemory(memId, { metadata: metadata })
+            // Use the dedicated `favorite` top-level field on PATCH. Sending it via
+            // `metadata` merges client-side keys server-side, so `delete metadata.favorite`
+            // never reaches the server and un-favoriting silently fails.
+            patchMemory(memId, { favorite: newState })
                 .then(function(updated) {
                     memoryCache[memId] = updated;
                     if (cachedTimelineMemories) {
@@ -1834,6 +1834,20 @@ div.vis-tooltip {
             renderPanelStatus('', '');
             document.querySelectorAll('.subsection-item.selected, .section-item.selected').forEach(el => el.classList.remove('selected'));
             updateTimelinePosition();
+            try { localStorage.setItem('memora-panel-open', '0'); } catch (e) {}
+        }
+
+        // Open the tabs panel on a non-memory tab (Timeline / Duplicates / History).
+        // Used on first load and for the "restore open state" path. Details tab is
+        // handled separately via showPanel(mem) because it needs a selected memory.
+        function openPanelOnTab(tabName) {
+            document.getElementById('panel').classList.add('active');
+            document.getElementById('resize-handle').classList.add('active');
+            document.body.classList.add('panel-open');
+            switchTab(tabName);
+            try { localStorage.setItem('memora-panel-open', '1'); } catch (e) {}
+            try { localStorage.setItem('memora-panel-tab', tabName); } catch (e) {}
+            updateTimelinePosition();
         }
 
         function showPanel(mem) {
@@ -1891,6 +1905,8 @@ div.vis-tooltip {
 
             highlightMemorySection(mem);
             updateTimelinePosition();
+            try { localStorage.setItem('memora-panel-open', '1'); } catch (e) {}
+            try { localStorage.setItem('memora-panel-tab', 'detail'); } catch (e) {}
         }
 
         // Resize handle
@@ -2421,9 +2437,48 @@ div.vis-tooltip {
             else if ((el = e.target.closest('[data-mem-id]'))) { e.preventDefault(); showMemoryDetails(parseInt(el.dataset.memId, 10)); }
         });
 
-        // Initialize database from URL and load graph
+        // Initialize database from URL and load graph. The tabs panel is opened
+        // by default AFTER the graph has loaded and physics has stabilized — if
+        // we open it synchronously here (before initGraph runs), vis-network
+        // measures a smaller container, stabilization fails to converge, and
+        // the nodes keep spinning. Chaining on the loadGraph promise lets the
+        // graph settle at full width first, then the panel opens and triggers
+        // vis-network's autoResize → redraw (not physics restart).
         if (MEMORA_CONFIG.dbSelector) initDbFromUrl();
-        loadGraph();
+        loadGraph().then(function() {
+            function openDefault() {
+                try {
+                    var openPref = localStorage.getItem('memora-panel-open');
+                    if (openPref === '0') return; // user closed it last time
+                    var tabPref = localStorage.getItem('memora-panel-tab');
+                    var tab = (tabPref === 'duplicates' || tabPref === 'history')
+                        ? tabPref
+                        : 'timeline';
+                    openPanelOnTab(tab);
+                } catch (e) {
+                    try { openPanelOnTab('timeline'); } catch (_) {}
+                }
+            }
+            // Wait for vis-network stabilization to complete before resizing
+            // the canvas. If network didn't initialize (graph load error),
+            // fall through and open the panel anyway so Timeline still works.
+            if (typeof network !== 'undefined' && network && typeof network.once === 'function') {
+                var fired = false;
+                network.once('stabilizationIterationsDone', function() {
+                    fired = true;
+                    openDefault();
+                });
+                // Safety net: if stabilization event never fires (empty graph,
+                // already-stable seed, etc.), open the panel after a short delay.
+                setTimeout(function() { if (!fired) openDefault(); }, 1500);
+            } else {
+                openDefault();
+            }
+        }).catch(function() {
+            // loadGraph error path — the error message is already rendered in
+            // #loading. Open the panel anyway so the user still gets Timeline.
+            try { openPanelOnTab('timeline'); } catch (_) {}
+        });
 
         // Real-time updates (WebSocket or SSE)
         var ws = null;
