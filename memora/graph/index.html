@@ -2426,7 +2426,14 @@ div.vis-tooltip {
             // Re-enable physics during drag so the graph feels elastic.
             // The 'stabilized' handler disables it again when motion settles.
             network.on('dragStart', function() {
-                try { network.setOptions({ physics: { enabled: true } }); } catch (_) {}
+                try {
+                    network.setOptions({ physics: { enabled: true } });
+                    network.startSimulation();
+                } catch (_) {}
+            });
+            // Also kick the simulation on dragEnd so released nodes settle elastically
+            network.on('dragEnd', function() {
+                try { network.startSimulation(); } catch (_) {}
             });
 
             // Init cluster hull overlays
