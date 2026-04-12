@@ -56,15 +56,32 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const dbName = url.searchParams.get("db");
   const db = getDatabase(env, dbName);
 
-  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 200);
+  // Favorites-only mode: server-side filter so the client Favorites view
+  // isn't limited to whatever the paginated timeline has already loaded
+  // (issue #544). Bumps the default limit so a larger favorites set
+  // comes back in a single round trip; still capped to 500.
+  const favoritesOnly = url.searchParams.get("favorites") === "1";
+  const defaultLimit = favoritesOnly ? 500 : 50;
+  const maxLimit = favoritesOnly ? 500 : 200;
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || String(defaultLimit), 10) || defaultLimit, 1), maxLimit);
   const offset = Math.max(parseInt(url.searchParams.get("offset") || "0", 10) || 0, 0);
 
-  const countRow = await db.prepare("SELECT COUNT(*) as cnt FROM memories").first<{ cnt: number }>();
+  // json_extract returns the native JSON type (boolean/number), so we
+  // check for 1 and 'true' to handle both encodings. Note: JSON true
+  // is stored as integer 1 in SQLite's json1 extension.
+  const whereClause = favoritesOnly
+    ? "WHERE json_extract(metadata, '$.favorite') IN (1, 'true')"
+    : "";
+
+  const countSql = "SELECT COUNT(*) as cnt FROM memories" + (whereClause ? " " + whereClause : "");
+  const countRow = await db.prepare(countSql).first<{ cnt: number }>();
   const total = countRow?.cnt ?? 0;
 
-  const result = await db.prepare(
-    "SELECT id, content, metadata, tags, created_at, updated_at FROM memories ORDER BY created_at DESC LIMIT ? OFFSET ?"
-  ).bind(limit, offset).all<Memory>();
+  const listSql = "SELECT id, content, metadata, tags, created_at, updated_at FROM memories" +
+    (whereClause ? " " + whereClause : "") +
+    " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+
+  const result = await db.prepare(listSql).bind(limit, offset).all<Memory>();
 
   const memories = (result.results || []).map(m => {
     const meta = parseJson<Record<string, unknown>>(m.metadata, {});

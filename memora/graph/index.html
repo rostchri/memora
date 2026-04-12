@@ -1527,6 +1527,7 @@ div.vis-tooltip {
             timelineOffset = 0;
             timelineTotal = 0;
             cachedTimelineMemories = null;
+            favoritesCache = null;
             document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#8b949e;">Loading...</div>';
             loadTimelinePage();
         }
@@ -1561,13 +1562,57 @@ div.vis-tooltip {
 
         var timelineFilter = 'all';
         var cachedTimelineMemories = null;
+        // Separate cache for the full server-side favorites set. The
+        // paginated `cachedTimelineMemories` only holds what's been loaded
+        // via "Load more" so a client-side favorites filter would miss
+        // anything further down the timeline (issue #544). Fetched on
+        // demand when the Favorites filter is activated and invalidated
+        // whenever the user toggles a favorite so stale entries can't
+        // linger.
+        var favoritesCache = null;
+        var favoritesLoading = false;
 
         function filterTimeline(mode) {
             timelineFilter = mode;
             document.querySelectorAll('#timeline-filter .filter-btn').forEach(function(btn) {
                 btn.classList.toggle('active', btn.textContent.indexOf(mode === 'favorites' ? 'Favorites' : 'Show All') !== -1);
             });
-            if (cachedTimelineMemories) renderTimelineList(cachedTimelineMemories);
+            if (mode === 'favorites') {
+                // Server-side authoritative fetch so page-N favorites are
+                // included. Use cached result if fresh; otherwise fetch.
+                if (favoritesCache) {
+                    renderTimelineList(favoritesCache);
+                } else if (!favoritesLoading) {
+                    favoritesLoading = true;
+                    document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#8b949e;">Loading favorites…</div>';
+                    var dbp = getDbParam();
+                    var sep = dbp ? dbp + '&' : '?';
+                    fetch('/api/memories' + sep + 'favorites=1')
+                        .then(function(r) { return r.json(); })
+                        .then(function(data) {
+                            favoritesLoading = false;
+                            favoritesCache = data.memories || [];
+                            // User may have flipped back to Show All while
+                            // the fetch was in flight — respect current mode.
+                            if (timelineFilter === 'favorites') {
+                                renderTimelineList(favoritesCache);
+                            }
+                        })
+                        .catch(function() {
+                            favoritesLoading = false;
+                            document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#f85149;">Error loading favorites</div>';
+                        });
+                }
+            } else {
+                // Show All — render from the paginated cache. If not yet
+                // loaded (user clicked Favorites first), kick off the
+                // normal pagination path.
+                if (cachedTimelineMemories) {
+                    renderTimelineList(cachedTimelineMemories);
+                } else {
+                    loadTimelinePage();
+                }
+            }
         }
 
         function renderTimelineList(memories) {
@@ -1578,7 +1623,6 @@ div.vis-tooltip {
                 var t = mem.metadata.type;
                 return t !== 'section' && t !== 'document_fragment';
             });
-            cachedTimelineMemories = memories;
             if (timelineFilter === 'favorites') {
                 memories = memories.filter(function(mem) { return mem.metadata && mem.metadata.favorite; });
             }
@@ -1643,15 +1687,21 @@ div.vis-tooltip {
                             if (mem.id === memId) cachedTimelineMemories[index] = updated;
                         });
                     }
+                    // Invalidate the server-side favorites cache so the
+                    // next Favorites-filter click refetches — otherwise
+                    // the newly (un)favorited memory shows the wrong
+                    // state or is missing (issue #544).
+                    favoritesCache = null;
                     if (currentPanelMemoryId === memId && !panelEditMode) {
                         showPanel(updated);
                     }
                     // #542: re-render the timeline list when in Favorites
                     // filter so the row disappears immediately on un-favorite
-                    // (and reappears on favorite). Without this the DOM stays
-                    // stale until the user switches filters or reloads.
-                    if (timelineFilter === 'favorites' && cachedTimelineMemories) {
-                        renderTimelineList(cachedTimelineMemories);
+                    // (and reappears on favorite). Re-trigger filterTimeline
+                    // to pick up the fresh server-side set now that
+                    // favoritesCache is invalidated.
+                    if (timelineFilter === 'favorites') {
+                        filterTimeline('favorites');
                     }
                 })
                 .catch(function() {
