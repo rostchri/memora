@@ -1549,50 +1549,12 @@ div.vis-tooltip {
                 + '  <div class="dup-pair-actions">'
                 + '    <button class="dup-action-btn" onclick="loadMemoryToPanel(' + p.a.id + ');switchTab(\'detail\');">View #' + p.a.id + '</button>'
                 + '    <button class="dup-action-btn" onclick="loadMemoryToPanel(' + p.b.id + ');switchTab(\'detail\');">View #' + p.b.id + '</button>'
-                + '    <button class="dup-action-btn primary" onclick="resolveDupPair(' + p.a.id + ',' + p.b.id + ',\'merge\')" title="Mark as merged into the newer memory">Merge into newer</button>'
-                + '    <button class="dup-action-btn" onclick="resolveDupPair(' + p.a.id + ',' + p.b.id + ',\'supersede_a\')" title="#' + p.a.id + ' supersedes #' + p.b.id + '">#' + p.a.id + ' supersedes</button>'
-                + '    <button class="dup-action-btn" onclick="resolveDupPair(' + p.a.id + ',' + p.b.id + ',\'supersede_b\')" title="#' + p.b.id + ' supersedes #' + p.a.id + '">#' + p.b.id + ' supersedes</button>'
-                + '    <button class="dup-action-btn" onclick="resolveDupPair(' + p.a.id + ',' + p.b.id + ',\'keep_both\')" title="Keep both, mark as not a duplicate">Keep both</button>'
-                + '    <button class="dup-action-btn danger" onclick="resolveDupPair(' + p.a.id + ',' + p.b.id + ',\'dismiss\')" title="Dismiss without a verdict">Dismiss</button>'
+                + '    <button class="dup-action-btn primary" disabled title="Not implemented yet">Merge into newer</button>'
+                + '    <button class="dup-action-btn" disabled title="Not implemented yet">Mark supersedes</button>'
+                + '    <button class="dup-action-btn" disabled title="Not implemented yet">Keep both</button>'
+                + '    <button class="dup-action-btn danger" disabled title="Not implemented yet">Dismiss</button>'
                 + '  </div>'
                 + '</div>';
-        }
-
-        // Block 4: wire duplicate-pair action buttons. Sends the resolution
-        // to /api/duplicates/resolve; on success the pair is removed from
-        // the in-memory list and the badge count is decremented. The
-        // server-side filter in duplicates.ts also excludes it from the
-        // next reload, so refreshes stay consistent.
-        async function resolveDupPair(aId, bId, action) {
-            try {
-                var dbp = getDbParam();
-                var sep = dbp ? dbp + '&' : '?';
-                var resp = await fetch('/api/duplicates/resolve' + sep.slice(0, -1), {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: action, a_id: aId, b_id: bId }),
-                });
-                var data = await resp.json();
-                if (!resp.ok || data.error) {
-                    alert('Action failed: ' + (data.error || resp.status));
-                    return;
-                }
-                // Optimistic update: drop the pair from the cached list.
-                if (duplicatesData && Array.isArray(duplicatesData.pairs)) {
-                    var lo = Math.min(aId, bId);
-                    var hi = Math.max(aId, bId);
-                    duplicatesData.pairs = duplicatesData.pairs.filter(function(p) {
-                        var pl = Math.min(p.a.id, p.b.id);
-                        var ph = Math.max(p.a.id, p.b.id);
-                        return !(pl === lo && ph === hi);
-                    });
-                    duplicatesData.total = Math.max(0, (duplicatesData.total || 1) - 1);
-                    renderDuplicatesList(duplicatesData);
-                    updateDuplicatesBadge(duplicatesData.total);
-                }
-            } catch (e) {
-                alert('Action failed: ' + (e && e.message ? e.message : e));
-            }
         }
 
         function loadMemoryToPanel(memId) {

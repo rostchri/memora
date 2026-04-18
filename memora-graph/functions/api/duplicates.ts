@@ -174,20 +174,6 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     });
   }
 
-  // Fetch any resolved pairs so we can skip them. Table may not exist on
-  // fresh databases — treat that as "no resolutions yet" rather than fail.
-  const resolved = new Set<string>();
-  try {
-    const resolvedResult = await db.prepare(
-      "SELECT lo_id, hi_id FROM duplicate_resolutions"
-    ).all<{ lo_id: number; hi_id: number }>();
-    for (const r of resolvedResult.results || []) {
-      resolved.add(`${r.lo_id}-${r.hi_id}`);
-    }
-  } catch {
-    // Table missing → no resolutions yet; continue.
-  }
-
   // Build unique pair set: (lo, hi) -> max score
   const pairScores = new Map<string, { lo: number; hi: number; score: number }>();
 
@@ -213,9 +199,6 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
       const lo = Math.min(cr.memory_id, ref.id);
       const hi = Math.max(cr.memory_id, ref.id);
       const key = `${lo}-${hi}`;
-      // Skip pairs the user has already resolved (merge/supersede/
-      // keep_both/dismiss all end up in duplicate_resolutions).
-      if (resolved.has(key)) continue;
       const existing = pairScores.get(key);
       if (!existing || ref.score > existing.score) {
         pairScores.set(key, { lo, hi, score: ref.score });
