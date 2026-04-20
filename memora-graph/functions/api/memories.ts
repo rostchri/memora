@@ -4,7 +4,7 @@
  *
  * Query params:
  *   favorites=1              → only favorited memories (legacy)
- *   type=issue               → only issue memories (matches metadata.type OR 'memora/issues' tag)
+ *   type=issue               → only issue memories (metadata.type == 'issue')
  *   status=open|closed       → issue status filter (normalizes legacy in_progress/resolved/wontfix)
  *   severity=critical|major|minor → issue severity (missing defaults to minor)
  *   component=<str>          → exact component match
@@ -107,9 +107,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   }
 
   if (isIssueQuery) {
-    clauses.push(
-      "(json_extract(metadata, '$.type') = 'issue' OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = 'memora/issues'))",
-    );
+    clauses.push("(json_extract(metadata, '$.type') = 'issue')");
   }
 
   if (statusFilter === "open") {
