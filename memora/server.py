@@ -454,6 +454,153 @@ def _hybrid_search(
     )
 
 
+def _digest_memory_preview(memory: Dict[str, Any], preview_chars: int) -> Dict[str, Any]:
+    content = memory.get("content", "") or ""
+    preview = content[:preview_chars] + "…" if len(content) > preview_chars else content
+    return {
+        "id": memory["id"],
+        "content_preview": preview,
+        "tags": memory.get("tags", []),
+        "metadata": memory.get("metadata"),
+        "created_at": memory.get("created_at"),
+        "updated_at": memory.get("updated_at"),
+    }
+
+
+def _dedupe_preserve_order(ids: List[int]) -> List[int]:
+    seen = set()
+    out = []
+    for memory_id in ids:
+        if memory_id in seen:
+            continue
+        seen.add(memory_id)
+        out.append(memory_id)
+    return out
+
+
+@_with_connection
+def _build_memory_digest(
+    conn,
+    topic: str,
+    k: int,
+    include_lineage: bool,
+    include_todos: bool,
+    include_related_hops: int,
+    preview_chars: int,
+) -> Dict[str, Any]:
+    results = hybrid_search(
+        conn,
+        topic,
+        top_k=k,
+        follow="active",
+    )
+
+    memory_ids: List[int] = []
+    memories: List[Dict[str, Any]] = []
+    for result in results:
+        memory = result.get("memory", result)
+        memory_ids.append(memory["id"])
+        preview = _digest_memory_preview(memory, preview_chars)
+        preview["score"] = result.get("score")
+        memories.append(preview)
+
+    lineage_chains: List[Dict[str, Any]] = []
+    lineage_ids: List[int] = []
+    if include_lineage:
+        seen_chains: set[tuple[int, ...]] = set()
+        for memory_id in memory_ids:
+            record = get_memory(conn, memory_id, follow="full_history")
+            if not record:
+                continue
+            history = record.get("history") or [record]
+            chain_ids = [m["id"] for m in history]
+            if len(chain_ids) <= 1:
+                continue
+            chain_key = tuple(chain_ids)
+            if chain_key in seen_chains:
+                continue
+            seen_chains.add(chain_key)
+            lineage_ids.extend(chain_ids)
+            lineage_chains.append({
+                "ids": chain_ids,
+                "active_ids": [mid for mid in chain_ids if mid in memory_ids],
+                "memories": [
+                    _digest_memory_preview(m, preview_chars)
+                    for m in history
+                ],
+            })
+
+    related_ids: List[int] = []
+    related_edges: List[Dict[str, Any]] = []
+    if include_related_hops > 0 and memory_ids:
+        frontier = list(memory_ids)
+        visited = set(memory_ids)
+        related_seen: set[int] = set()
+        for hop in range(1, min(include_related_hops, 3) + 1):
+            next_frontier: List[int] = []
+            for source_id in frontier:
+                for ref in get_crossrefs(conn, source_id):
+                    edge_type = ref.get("edge_type", "related_to")
+                    if edge_type in {"supersedes", "superseded_by"}:
+                        continue
+                    try:
+                        target_id = int(ref.get("id"))
+                    except (TypeError, ValueError):
+                        continue
+                    target = get_memory(conn, target_id)
+                    if not target:
+                        continue
+                    if target_id not in related_seen:
+                        related_seen.add(target_id)
+                        related_ids.append(target_id)
+                    if target_id not in visited:
+                        visited.add(target_id)
+                        next_frontier.append(target_id)
+                    related_edges.append({
+                        "from": source_id,
+                        "to": target_id,
+                        "hop": hop,
+                        "edge_type": edge_type,
+                        "score": ref.get("score"),
+                    })
+            frontier = next_frontier
+            if not frontier:
+                break
+
+    todos: List[Dict[str, Any]] = []
+    issues: List[Dict[str, Any]] = []
+    if include_todos:
+        todos = [
+            _digest_memory_preview(item, preview_chars)
+            for item in list_memories(conn, query=topic, tags_any=["memora/todos"], limit=k, follow="active")
+        ]
+        issues = [
+            _digest_memory_preview(item, preview_chars)
+            for item in list_memories(conn, query=topic, tags_any=["memora/issues"], limit=k, follow="active")
+        ]
+
+    source_ids = _dedupe_preserve_order(
+        memory_ids
+        + lineage_ids
+        + related_ids
+        + [item["id"] for item in todos]
+        + [item["id"] for item in issues]
+    )
+
+    return {
+        "topic": topic,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "memory_ids": memory_ids,
+        "memories": memories,
+        "lineage_chains": lineage_chains,
+        "related_ids": _dedupe_preserve_order(related_ids),
+        "related_edges": related_edges,
+        "todos": todos,
+        "issues": issues,
+        "source_ids": source_ids,
+    }
+
+
 @_with_connection(writes=True)
 def _rebuild_embeddings(conn):
     return rebuild_embeddings(conn)
@@ -1734,6 +1881,68 @@ async def memory_hybrid_search(
             response["warning"] = warning
     response["results"] = results
     return response
+
+
+@mcp.tool()
+async def memory_digest(
+    topic: str,
+    k: int = 20,
+    include_lineage: bool = True,
+    include_todos: bool = True,
+    include_related_hops: int = 1,
+    synthesize: bool = False,
+    preview_chars: int = 240,
+) -> Dict[str, Any]:
+    """Return a deterministic digest of memories related to a topic.
+
+    The digest is an aggregation surface for agents that need current context,
+    not a narrative generator. It combines active hybrid-search hits, optional
+    supersession lineage, related memory ids, and matching TODO/issue memories.
+    Raw source ids are always returned so callers can inspect primitives if the
+    digest is too broad or too narrow.
+
+    Args:
+        topic: Subject to digest.
+        k: Maximum active search hits and TODO/issue matches to include.
+        include_lineage: Include supersession history for active hits.
+        include_todos: Include matching memora/todos and memora/issues entries.
+        include_related_hops: Number of cross-reference hops to collect, capped at 3.
+        synthesize: Reserved for future LLM synthesis. False by default.
+        preview_chars: Preview length per returned memory.
+    """
+    topic = topic.strip()
+    if not topic:
+        return {"error": "invalid_input", "message": "topic must not be empty"}
+    if k < 1:
+        return {"error": "invalid_input", "message": "k must be >= 1"}
+    if k > 100:
+        return {"error": "invalid_input", "message": "k must be <= 100"}
+    if include_related_hops < 0:
+        return {"error": "invalid_input", "message": "include_related_hops must be >= 0"}
+    if preview_chars < 40:
+        return {"error": "invalid_input", "message": "preview_chars must be >= 40"}
+
+    digest = _build_memory_digest(
+        topic,
+        k,
+        include_lineage,
+        include_todos,
+        include_related_hops,
+        preview_chars,
+    )
+    digest["parameters"] = {
+        "k": k,
+        "include_lineage": include_lineage,
+        "include_todos": include_todos,
+        "include_related_hops": min(include_related_hops, 3),
+        "synthesize": synthesize,
+        "preview_chars": preview_chars,
+    }
+    if synthesize:
+        digest["warnings"] = [
+            "synthesize=true is reserved for a future LLM synthesis mode; v1 returns deterministic aggregation only."
+        ]
+    return digest
 
 
 @mcp.tool()

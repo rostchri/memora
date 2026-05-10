@@ -2137,6 +2137,7 @@ def add_link(
         links_created.append({"from": to_id, "to": from_id, "edge_type": reverse_type})
 
     _log_action(conn, from_id, "link", f"Linked #{from_id} -> #{to_id} ({edge_type})")
+    conn.commit()
     return {"status": "linked", "links": links_created}
 
 
@@ -2177,6 +2178,7 @@ def remove_link(
 
     if removed:
         _log_action(conn, from_id, "unlink", f"Unlinked #{from_id} -> #{to_id}")
+        conn.commit()
     return {"status": "unlinked", "removed": removed}
 
 
