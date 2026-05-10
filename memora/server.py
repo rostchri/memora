@@ -478,6 +478,127 @@ def _dedupe_preserve_order(ids: List[int]) -> List[int]:
     return out
 
 
+def _append_digest_memory(
+    items: List[Dict[str, Any]],
+    seen_ids: set[int],
+    memory: Dict[str, Any],
+    preview_chars: int,
+    *,
+    score: Optional[float] = None,
+    source: Optional[str] = None,
+) -> None:
+    memory_id = memory["id"]
+    if memory_id in seen_ids:
+        return
+    seen_ids.add(memory_id)
+    preview = _digest_memory_preview(memory, preview_chars)
+    if score is not None:
+        preview["score"] = score
+    if source is not None:
+        preview["source"] = source
+    items.append(preview)
+
+
+def _has_digest_tag(memory: Dict[str, Any], tag: str) -> bool:
+    return tag in set(memory.get("tags") or [])
+
+
+def _digest_bucket_type(bucket_tag: str) -> Optional[str]:
+    if bucket_tag == "memora/todos":
+        return "todo"
+    if bucket_tag == "memora/issues":
+        return "issue"
+    return None
+
+
+def _memory_metadata_type(memory: Dict[str, Any]) -> Optional[str]:
+    metadata = memory.get("metadata")
+    if isinstance(metadata, dict):
+        value = metadata.get("type")
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _active_item_matches_bucket(memory: Dict[str, Any], bucket_tag: str) -> bool:
+    bucket_type = _digest_bucket_type(bucket_tag)
+    return _has_digest_tag(memory, bucket_tag) or (
+        bucket_type is not None and _memory_metadata_type(memory) == bucket_type
+    )
+
+
+def _metadata_filters_for_bucket_type(
+    metadata_filters: Optional[Dict[str, Any]],
+    bucket_type: str,
+) -> Optional[Dict[str, Any]]:
+    combined = dict(metadata_filters or {})
+    existing_type = combined.get("type")
+    if existing_type is not None and existing_type != bucket_type:
+        return None
+    combined["type"] = bucket_type
+    return combined
+
+
+def _list_digest_bucket(
+    conn,
+    topic: str,
+    bucket_tag: str,
+    k: int,
+    metadata_filters: Optional[Dict[str, Any]],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    tags_any: Optional[List[str]],
+    tags_all: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    combined_tags_all = list(tags_all or [])
+    if bucket_tag not in combined_tags_all:
+        combined_tags_all.append(bucket_tag)
+    for item in list_memories(
+        conn,
+        query=topic,
+        metadata_filters=metadata_filters,
+        limit=k,
+        date_from=date_from,
+        date_to=date_to,
+        tags_any=tags_any,
+        tags_all=combined_tags_all,
+        tags_none=None,
+        follow="active",
+    ):
+        if item["id"] not in seen_ids:
+            seen_ids.add(item["id"])
+            items.append(item)
+
+    bucket_type = _digest_bucket_type(bucket_tag)
+    if bucket_type is None:
+        return items
+
+    typed_metadata_filters = _metadata_filters_for_bucket_type(metadata_filters, bucket_type)
+    if typed_metadata_filters is None:
+        return items
+
+    for item in list_memories(
+        conn,
+        query=topic,
+        metadata_filters=typed_metadata_filters,
+        limit=k,
+        date_from=date_from,
+        date_to=date_to,
+        tags_any=tags_any,
+        tags_all=tags_all,
+        tags_none=None,
+        follow="active",
+    ):
+        if item["id"] not in seen_ids:
+            seen_ids.add(item["id"])
+            items.append(item)
+
+    return items
+
+
 @_with_connection
 def _build_memory_digest(
     conn,
@@ -487,22 +608,62 @@ def _build_memory_digest(
     include_todos: bool,
     include_related_hops: int,
     preview_chars: int,
+    metadata_filters: Optional[Dict[str, Any]],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    tags_any: Optional[List[str]],
+    tags_all: Optional[List[str]],
+    seed_ids: Optional[List[int]],
+    debug: bool,
 ) -> Dict[str, Any]:
     results = hybrid_search(
         conn,
         topic,
         top_k=k,
+        metadata_filters=metadata_filters,
+        date_from=date_from,
+        date_to=date_to,
+        tags_any=tags_any,
+        tags_all=tags_all,
         follow="active",
     )
 
     memory_ids: List[int] = []
     memories: List[Dict[str, Any]] = []
+    active_memories: List[Dict[str, Any]] = []
+    ranked_candidates: List[Dict[str, Any]] = []
+    seen_memory_ids: set[int] = set()
     for result in results:
         memory = result.get("memory", result)
-        memory_ids.append(memory["id"])
-        preview = _digest_memory_preview(memory, preview_chars)
-        preview["score"] = result.get("score")
-        memories.append(preview)
+        memory_id = memory["id"]
+        score = result.get("score")
+        ranked_candidates.append({
+            "id": memory_id,
+            "score": score,
+            "source": "hybrid_search",
+        })
+        if memory_id in seen_memory_ids:
+            continue
+        memory_ids.append(memory_id)
+        active_memories.append(memory)
+        _append_digest_memory(memories, seen_memory_ids, memory, preview_chars, score=score)
+
+    missing_seed_ids: List[int] = []
+    for seed_id in seed_ids or []:
+        if seed_id in seen_memory_ids:
+            continue
+        seed = get_memory(conn, seed_id)
+        if not seed:
+            missing_seed_ids.append(seed_id)
+            continue
+        memory_ids.append(seed["id"])
+        active_memories.append(seed)
+        _append_digest_memory(memories, seen_memory_ids, seed, preview_chars, source="seed")
+        ranked_candidates.append({
+            "id": seed["id"],
+            "score": None,
+            "source": "seed",
+        })
 
     lineage_chains: List[Dict[str, Any]] = []
     lineage_ids: List[int] = []
@@ -570,14 +731,37 @@ def _build_memory_digest(
     todos: List[Dict[str, Any]] = []
     issues: List[Dict[str, Any]] = []
     if include_todos:
-        todos = [
-            _digest_memory_preview(item, preview_chars)
-            for item in list_memories(conn, query=topic, tags_any=["memora/todos"], limit=k, follow="active")
-        ]
-        issues = [
-            _digest_memory_preview(item, preview_chars)
-            for item in list_memories(conn, query=topic, tags_any=["memora/issues"], limit=k, follow="active")
-        ]
+        todo_seen: set[int] = set()
+        issue_seen: set[int] = set()
+        for memory in active_memories:
+            if _active_item_matches_bucket(memory, "memora/todos"):
+                _append_digest_memory(todos, todo_seen, memory, preview_chars, source="active_hit")
+            if _active_item_matches_bucket(memory, "memora/issues"):
+                _append_digest_memory(issues, issue_seen, memory, preview_chars, source="active_hit")
+        for item in _list_digest_bucket(
+            conn,
+            topic,
+            "memora/todos",
+            k,
+            metadata_filters,
+            date_from,
+            date_to,
+            tags_any,
+            tags_all,
+        ):
+            _append_digest_memory(todos, todo_seen, item, preview_chars, source="topic_match")
+        for item in _list_digest_bucket(
+            conn,
+            topic,
+            "memora/issues",
+            k,
+            metadata_filters,
+            date_from,
+            date_to,
+            tags_any,
+            tags_all,
+        ):
+            _append_digest_memory(issues, issue_seen, item, preview_chars, source="topic_match")
 
     source_ids = _dedupe_preserve_order(
         memory_ids
@@ -587,7 +771,7 @@ def _build_memory_digest(
         + [item["id"] for item in issues]
     )
 
-    return {
+    digest = {
         "topic": topic,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "memory_ids": memory_ids,
@@ -599,6 +783,24 @@ def _build_memory_digest(
         "issues": issues,
         "source_ids": source_ids,
     }
+    if debug:
+        digest["debug"] = {
+            "ranked_candidates": ranked_candidates,
+            "applied_filters": {
+                "tags_any": tags_any,
+                "tags_all": tags_all,
+                "metadata_filters": metadata_filters,
+                "date_from": date_from,
+                "date_to": date_to,
+            },
+            "filter_note": (
+                "Hybrid search and separately discovered TODO/issue matches honor filters; "
+                "seed_ids are included explicitly and bypass filters."
+            ),
+            "seed_ids": seed_ids or [],
+            "missing_seed_ids": missing_seed_ids,
+        }
+    return digest
 
 
 @_with_connection(writes=True)
@@ -1892,6 +2094,13 @@ async def memory_digest(
     include_related_hops: int = 1,
     synthesize: bool = False,
     preview_chars: int = 240,
+    tags_any: Optional[List[str]] = None,
+    tags_all: Optional[List[str]] = None,
+    metadata_filters: Optional[Dict[str, Any]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    seed_ids: Optional[List[int]] = None,
+    debug: bool = False,
 ) -> Dict[str, Any]:
     """Return a deterministic digest of memories related to a topic.
 
@@ -1909,6 +2118,13 @@ async def memory_digest(
         include_related_hops: Number of cross-reference hops to collect, capped at 3.
         synthesize: Reserved for future LLM synthesis. False by default.
         preview_chars: Preview length per returned memory.
+        tags_any: Restrict hybrid search and discovered TODO/issue matches to memories with any of these tags.
+        tags_all: Restrict hybrid search and discovered TODO/issue matches to memories with all of these tags.
+        metadata_filters: Optional metadata filters.
+        date_from: Optional created_at lower bound (ISO or relative like "7d").
+        date_to: Optional created_at upper bound (ISO or relative like "7d").
+        seed_ids: Explicit memory ids to include as source memories and expand lineage/related from.
+        debug: Include ranked candidates, applied filters, and seed/filter notes.
     """
     topic = topic.strip()
     if not topic:
@@ -1921,15 +2137,34 @@ async def memory_digest(
         return {"error": "invalid_input", "message": "include_related_hops must be >= 0"}
     if preview_chars < 40:
         return {"error": "invalid_input", "message": "preview_chars must be >= 40"}
+    if seed_ids is not None:
+        if len(seed_ids) > 100:
+            return {"error": "invalid_input", "message": "seed_ids must contain <= 100 ids"}
+        try:
+            seed_ids = [int(memory_id) for memory_id in seed_ids]
+        except (TypeError, ValueError):
+            return {"error": "invalid_input", "message": "seed_ids must be a list of integer ids"}
+        if any(memory_id < 1 for memory_id in seed_ids):
+            return {"error": "invalid_input", "message": "seed_ids must be positive integer ids"}
 
-    digest = _build_memory_digest(
-        topic,
-        k,
-        include_lineage,
-        include_todos,
-        include_related_hops,
-        preview_chars,
-    )
+    try:
+        digest = _build_memory_digest(
+            topic,
+            k,
+            include_lineage,
+            include_todos,
+            include_related_hops,
+            preview_chars,
+            metadata_filters,
+            date_from,
+            date_to,
+            tags_any,
+            tags_all,
+            seed_ids,
+            debug,
+        )
+    except ValueError as exc:
+        return {"error": "invalid_filters", "message": str(exc)}
     digest["parameters"] = {
         "k": k,
         "include_lineage": include_lineage,
@@ -1937,6 +2172,13 @@ async def memory_digest(
         "include_related_hops": min(include_related_hops, 3),
         "synthesize": synthesize,
         "preview_chars": preview_chars,
+        "tags_any": tags_any,
+        "tags_all": tags_all,
+        "metadata_filters": metadata_filters,
+        "date_from": date_from,
+        "date_to": date_to,
+        "seed_ids": seed_ids or [],
+        "debug": debug,
     }
     if synthesize:
         digest["warnings"] = [

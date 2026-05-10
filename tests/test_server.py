@@ -1,5 +1,6 @@
 import asyncio
 
+import memora.storage as storage
 import memora.server as server
 
 
@@ -7,6 +8,11 @@ def _new_memory(*args, content="Repeat memory text", tags=["task"], **kwargs):
     return asyncio.run(
         server.memory_create(*args, content=content, tags=tags, **kwargs)
     )
+
+
+def _raw_memory(*, content, tags, metadata=None):
+    with storage.connect() as conn:
+        return storage.add_memory(conn, content=content, tags=tags, metadata=metadata)
 
 
 def test_memory_create_minimal_response_returns_id_only(local_db):
@@ -53,15 +59,25 @@ def test_memory_digest_returns_deterministic_aggregation(local_db):
         content="Worker registration keeps live agent role metadata available",
         tags=["clmux", "agent-routing"],
     )["memory"]
-    _new_memory(
+    todo = _new_memory(
         content="TODO: improve agent routing diagnostics",
         tags=["clmux", "agent-routing", "memora/todos"],
         metadata={"type": "todo", "status": "open"},
-    )
-    _new_memory(
+    )["memory"]
+    issue = _new_memory(
         content="Issue: agent routing multiline injected asks may not wake panes",
         tags=["clmux", "agent-routing", "memora/issues"],
         metadata={"type": "issue", "status": "open"},
+    )["memory"]
+    issue_by_type = _raw_memory(
+        content="Issue: agent routing prompt hang stored without issue tag",
+        tags=["clmux", "agent-routing"],
+        metadata={"type": "issue", "status": "open"},
+    )
+    todo_by_type = _raw_memory(
+        content="Agent routing diagnostic followup stored without todo tag",
+        tags=["clmux", "agent-routing"],
+        metadata={"type": "todo", "status": "open"},
     )
 
     asyncio.run(server.memory_link(current["id"], old["id"], "supersedes"))
@@ -79,9 +95,70 @@ def test_memory_digest_returns_deterministic_aggregation(local_db):
     assert related["id"] in digest["related_ids"]
     assert digest["todos"]
     assert digest["issues"]
+    assert any(item["id"] == todo["id"] for item in digest["todos"])
+    assert any(item["id"] == todo_by_type["id"] for item in digest["todos"])
+    assert any(item["id"] == issue["id"] for item in digest["issues"])
+    assert any(item["id"] == issue_by_type["id"] for item in digest["issues"])
     assert current["id"] in digest["source_ids"]
     assert old["id"] in digest["source_ids"]
     assert related["id"] in digest["source_ids"]
+
+
+def test_memory_digest_filters_seeds_and_debug(local_db):
+    filtered = _new_memory(
+        content="Filtered digest target topic current plan",
+        tags=["alpha", "digest"],
+        metadata={"project": "target"},
+    )["memory"]
+    excluded = _new_memory(
+        content="Filtered digest target topic excluded plan",
+        tags=["beta", "digest"],
+        metadata={"project": "other"},
+    )["memory"]
+    seed = _new_memory(
+        content="Explicit seed unrelated to target query",
+        tags=["seed-only"],
+        metadata={"project": "seed"},
+    )["memory"]
+    related = _new_memory(
+        content="Seed related expansion target",
+        tags=["seed-only"],
+    )["memory"]
+    issue = _new_memory(
+        content="Filtered digest target topic issue",
+        tags=["alpha", "memora/issues"],
+        metadata={"project": "target", "type": "issue", "status": "open"},
+    )["memory"]
+    other_issue = _new_memory(
+        content="Filtered digest target topic other issue",
+        tags=["beta", "memora/issues"],
+        metadata={"project": "other", "type": "issue", "status": "open"},
+    )["memory"]
+    asyncio.run(server.memory_link(seed["id"], related["id"], "related_to"))
+
+    digest = asyncio.run(
+        server.memory_digest(
+            "target topic",
+            k=10,
+            tags_all=["alpha"],
+            metadata_filters={"project": "target"},
+            seed_ids=[seed["id"], 999999],
+            debug=True,
+        )
+    )
+
+    assert filtered["id"] in digest["memory_ids"]
+    assert excluded["id"] not in digest["memory_ids"]
+    assert seed["id"] in digest["memory_ids"]
+    assert related["id"] in digest["related_ids"]
+    assert any(item["id"] == issue["id"] for item in digest["issues"])
+    assert all(item["id"] != other_issue["id"] for item in digest["issues"])
+    assert digest["parameters"]["tags_all"] == ["alpha"]
+    assert digest["parameters"]["metadata_filters"] == {"project": "target"}
+    assert digest["parameters"]["seed_ids"] == [seed["id"], 999999]
+    assert digest["debug"]["missing_seed_ids"] == [999999]
+    assert digest["debug"]["ranked_candidates"]
+    assert "seed_ids are included explicitly" in digest["debug"]["filter_note"]
 
 
 def test_memory_digest_synthesize_is_warning_only(local_db):
