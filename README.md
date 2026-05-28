@@ -4,7 +4,7 @@
 
 <p align="center">
 <b>Give your AI agents persistent memory</b><br>
-A lightweight MCP server for semantic memory storage, knowledge graphs, conversational recall, and cross-session context.
+An MCP memory layer for agents: structured storage, semantic retrieval, graph relations, and source-backed cross-session context.
 </p>
 
 <p align="center">
@@ -14,12 +14,15 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, conversa
 </p>
 
 <p align="center">
-<img src="media/demo.gif" alt="Memora Demo" width="400">
-<img src="media/demo2.gif" alt="Memora Demo" width="400">
+<img src="media/memora-absorb-digest-flow.gif" alt="Memora absorb and digest flow" width="820">
 </p>
 
 <p align="center">
-<b><a href="#features">Features</a></b> · <b><a href="#install">Install</a></b> · <b><a href="#usage">Usage</a></b> · <b><a href="#configuration">Config</a></b> · <b><a href="#live-graph-server">Live Graph</a></b> · <b><a href="#cloud-graph">Cloud Graph</a></b> · <b><a href="#chat-with-memories">Chat</a></b> · <b><a href="#semantic-search--embeddings">Semantic Search</a></b> · <b><a href="#document-storage">Documents</a></b> · <b><a href="#llm-deduplication">LLM Dedup</a></b> · <b><a href="#memory-linking">Linking</a></b> · <b><a href="#neovim-integration">Neovim</a></b>
+<b>Absorb agent work into durable graph memory, then use <code>memory_digest(topic)</code> to retrieve relevant memories, TODOs/issues, related edges, and source IDs.</b>
+</p>
+
+<p align="center">
+<b><a href="#features">Features</a></b> · <b><a href="#preview">Preview</a></b> · <b><a href="#install">Install</a></b> · <b><a href="#usage">Usage</a></b> · <b><a href="#configuration">Config</a></b> · <b><a href="#live-graph-server">Live Graph</a></b> · <b><a href="#cloud-graph">Cloud Graph</a></b> · <b><a href="#chat-with-memories">Chat</a></b> · <b><a href="#semantic-search--embeddings">Semantic Search</a></b> · <b><a href="#document-storage">Documents</a></b> · <b><a href="#llm-deduplication">LLM Dedup</a></b> · <b><a href="#memory-linking">Linking</a></b> · <b><a href="#neovim-integration">Neovim</a></b>
 </p>
 
 ## Features
@@ -50,6 +53,13 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, conversa
 - 📊 **Statistics & Analytics** - Tag usage, trends, and connection insights
 - 🧠 **Memory Insights** - Activity summary, stale detection, consolidation suggestions, and LLM-powered pattern analysis
 - 📜 **Action History** - Track all memory operations (create, update, delete, merge, boost, link) with grouped timeline view
+
+## Preview
+
+<p align="center">
+<img src="media/demo.gif" alt="Memora memory graph demo" width="320">
+<img src="media/demo2.gif" alt="Memora memory interaction demo" width="320">
+</p>
 
 ## Install
 
