@@ -129,23 +129,33 @@ def _compute_embedding_openai(text: str) -> Dict[str, float]:
     try:
         import openai
 
-        api_key = os.getenv("OPENAI_API_KEY")
+        # Getrennter Embedding-Provider: MEMORA_EMBEDDING_* hat Vorrang, Fallback auf OPENAI_*
+        api_key = os.getenv("MEMORA_EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY")
         if not api_key:
             if _strict_mode():
                 raise RuntimeError(
-                    "MEMORA_EMBEDDING_STRICT=1 and OPENAI_API_KEY is not set"
+                    "MEMORA_EMBEDDING_STRICT=1 and neither MEMORA_EMBEDDING_API_KEY "
+                    "nor OPENAI_API_KEY is set"
                 )
             _warn_once(
                 "openai:no-api-key",
-                "OPENAI_API_KEY is not set",
+                "MEMORA_EMBEDDING_API_KEY and OPENAI_API_KEY are not set",
             )
             return _compute_embedding_tfidf(text)
 
         if "openai_client" not in _embedding_model_cache:
-            _embedding_model_cache["openai_client"] = openai.OpenAI(api_key=api_key)
+            base_url = os.getenv("MEMORA_EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+            client_kwargs: Dict[str, Any] = {"api_key": api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            _embedding_model_cache["openai_client"] = openai.OpenAI(**client_kwargs)
 
         client = _embedding_model_cache["openai_client"]
-        model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        # MEMORA_EMBEDDING_MODEL hat Vorrang vor OPENAI_EMBEDDING_MODEL
+        model_name = (
+            os.getenv("MEMORA_EMBEDDING_MODEL")
+            or os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        )
 
         response = client.embeddings.create(
             input=text,
@@ -222,23 +232,33 @@ def _compute_embeddings_openai_batch(texts: List[str]) -> List[Dict[str, float]]
     try:
         import openai
 
-        api_key = os.getenv("OPENAI_API_KEY")
+        # Getrennter Embedding-Provider: MEMORA_EMBEDDING_* hat Vorrang, Fallback auf OPENAI_*
+        api_key = os.getenv("MEMORA_EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY")
         if not api_key:
             if _strict_mode():
                 raise RuntimeError(
-                    "MEMORA_EMBEDDING_STRICT=1 and OPENAI_API_KEY is not set"
+                    "MEMORA_EMBEDDING_STRICT=1 and neither MEMORA_EMBEDDING_API_KEY "
+                    "nor OPENAI_API_KEY is set"
                 )
             _warn_once(
                 "openai-batch:no-api-key",
-                "OPENAI_API_KEY is not set",
+                "MEMORA_EMBEDDING_API_KEY and OPENAI_API_KEY are not set",
             )
             return [_compute_embedding_tfidf(t) for t in texts]
 
         if "openai_client" not in _embedding_model_cache:
-            _embedding_model_cache["openai_client"] = openai.OpenAI(api_key=api_key)
+            base_url = os.getenv("MEMORA_EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+            client_kwargs: Dict[str, Any] = {"api_key": api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            _embedding_model_cache["openai_client"] = openai.OpenAI(**client_kwargs)
 
         client = _embedding_model_cache["openai_client"]
-        model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        # MEMORA_EMBEDDING_MODEL hat Vorrang vor OPENAI_EMBEDDING_MODEL
+        model_name = (
+            os.getenv("MEMORA_EMBEDDING_MODEL")
+            or os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        )
 
         max_chunk = 2048  # OpenAI batch limit
         all_results: List[Dict[str, float]] = []
