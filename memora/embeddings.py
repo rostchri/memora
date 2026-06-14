@@ -151,11 +151,10 @@ def _compute_embedding_openai(text: str) -> Dict[str, float]:
             _embedding_model_cache["openai_client"] = openai.OpenAI(**client_kwargs)
 
         client = _embedding_model_cache["openai_client"]
-        # MEMORA_EMBEDDING_MODEL hat Vorrang vor OPENAI_EMBEDDING_MODEL
-        model_name = (
-            os.getenv("MEMORA_EMBEDDING_MODEL")
-            or os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-        )
+        # Embedding-Modellname via OPENAI_EMBEDDING_MODEL. BEWUSST NICHT
+        # MEMORA_EMBEDDING_MODEL — das ist in storage.py der Backend-SELEKTOR
+        # (openai/sentence-transformers/tfidf); als Modellname wuerde es kollidieren.
+        model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
         response = client.embeddings.create(
             input=text,
@@ -254,11 +253,10 @@ def _compute_embeddings_openai_batch(texts: List[str]) -> List[Dict[str, float]]
             _embedding_model_cache["openai_client"] = openai.OpenAI(**client_kwargs)
 
         client = _embedding_model_cache["openai_client"]
-        # MEMORA_EMBEDDING_MODEL hat Vorrang vor OPENAI_EMBEDDING_MODEL
-        model_name = (
-            os.getenv("MEMORA_EMBEDDING_MODEL")
-            or os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-        )
+        # Embedding-Modellname via OPENAI_EMBEDDING_MODEL. BEWUSST NICHT
+        # MEMORA_EMBEDDING_MODEL — das ist in storage.py der Backend-SELEKTOR
+        # (openai/sentence-transformers/tfidf); als Modellname wuerde es kollidieren.
+        model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
         max_chunk = 2048  # OpenAI batch limit
         all_results: List[Dict[str, float]] = []
