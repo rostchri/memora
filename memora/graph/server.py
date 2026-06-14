@@ -573,7 +573,12 @@ def start_graph_server(host: str, port: int) -> None:
             if not client:
                 return JSONResponse(
                     {"error": "llm_not_configured",
-                     "message": "LLM not configured. Set OPENAI_API_KEY and OPENAI_BASE_URL environment variables."},
+                     # Getrennter LLM-Provider: MEMORA_LLM_* hat Vorrang, Fallback auf OPENAI_*
+                     "message": (
+                         "LLM not configured. Set MEMORA_LLM_API_KEY (and optionally "
+                         "MEMORA_LLM_BASE_URL) for a dedicated LLM provider, or fall back "
+                         "to OPENAI_API_KEY / OPENAI_BASE_URL."
+                     )},
                     status_code=503,
                 )
 
